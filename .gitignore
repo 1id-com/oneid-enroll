@@ -1,0 +1,17 @@
+# Dev-build artifacts in repo root (not the build/ folder)
+/oneid-enroll
+/oneid-enroll.exe
+
+# Go build cache
+vendor/
+
+# GPG agent sockets (not portable across machines)
+signing/gpg/S.gpg-agent*
+signing/gpg/*.lock
+signing/gpg/pubring.kbx~
+
+# Windows resource intermediates
+*.syso
+
+# Makefile sync marker (not part of the source)
+DANGER-IMPORTANT-READ-FIRST.md

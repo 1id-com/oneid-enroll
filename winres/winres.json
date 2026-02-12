@@ -1,0 +1,55 @@
+{
+  "RT_GROUP_ICON": {
+    "APP": {
+      "0000": "icon.ico"
+    }
+  },
+  "RT_MANIFEST": {
+    "#1": {
+      "0409": {
+        "identity": {
+          "name": "1id.com.oneid-enroll",
+          "version": "0.1.0.0"
+        },
+        "description": "1id.com HSM Identity Enrollment Helper",
+        "minimum-os": "win7",
+        "execution-level": "as invoker",
+        "ui-access": false,
+        "auto-elevate": false,
+        "dpi-awareness": "system",
+        "disable-theming": false,
+        "disable-window-filtering": false,
+        "high-resolution-scrolling-aware": false,
+        "ultra-high-resolution-scrolling-aware": false,
+        "long-path-aware": true,
+        "printer-driver-isolation": false,
+        "gdi-scaling": false,
+        "segment-heap": false,
+        "use-common-controls-v6": false
+      }
+    }
+  },
+  "RT_VERSION": {
+    "#1": {
+      "0000": {
+        "fixed": {
+          "file_version": "0.1.0.0",
+          "product_version": "0.1.0.0"
+        },
+        "info": {
+          "0409": {
+            "Comments": "Hardware Security Module helper for AI agent identity enrollment",
+            "CompanyName": "Aura Friday",
+            "FileDescription": "1id.com HSM Identity Enrollment Helper",
+            "FileVersion": "0.1.0.0",
+            "InternalName": "oneid-enroll",
+            "LegalCopyright": "Copyright 2026 Aura Friday. Apache-2.0 License.",
+            "OriginalFilename": "oneid-enroll.exe",
+            "ProductName": "1id.com Identity SDK",
+            "ProductVersion": "0.1.0"
+          }
+        }
+      }
+    }
+  }
+}
