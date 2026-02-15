@@ -1,4 +1,4 @@
-module github.com/AuraFriday/oneid-enroll
+module github.com/1id-com/oneid-enroll
 
 go 1.24
 

@@ -36,7 +36,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AuraFriday/oneid-enroll/internal/tpm"
+	"github.com/1id-com/oneid-enroll/internal/tpm"
 	"github.com/google/go-tpm/tpm2/transport"
 )
 

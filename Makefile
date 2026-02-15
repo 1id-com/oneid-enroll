@@ -14,7 +14,7 @@
 
 VERSION     ?= 0.1.0
 BINARY_NAME  = oneid-enroll
-MODULE       = github.com/AuraFriday/oneid-enroll
+MODULE       = github.com/1id-com/oneid-enroll
 CMD_DIR      = ./cmd/oneid-enroll
 BUILD_DIR    = ./build
 SIGNING_DIR  = ./signing

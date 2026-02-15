@@ -30,11 +30,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/AuraFriday/oneid-enroll/internal/elevate"
-	"github.com/AuraFriday/oneid-enroll/internal/piv"
-	"github.com/AuraFriday/oneid-enroll/internal/protocol"
-	"github.com/AuraFriday/oneid-enroll/internal/session"
-	"github.com/AuraFriday/oneid-enroll/internal/tpm"
+	"github.com/1id-com/oneid-enroll/internal/elevate"
+	"github.com/1id-com/oneid-enroll/internal/piv"
+	"github.com/1id-com/oneid-enroll/internal/protocol"
+	"github.com/1id-com/oneid-enroll/internal/session"
+	"github.com/1id-com/oneid-enroll/internal/tpm"
 	"github.com/google/go-tpm/tpm2/transport"
 )
 

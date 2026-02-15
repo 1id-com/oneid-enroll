@@ -28,7 +28,7 @@ oneid-enroll version --json
 ```
 
 The binary is normally invoked automatically by the
-[oneid-sdk](https://github.com/AuraFriday/oneid-sdk) Python package.
+[oneid-sdk](https://github.com/1id-com/oneid-sdk) Python package.
 You don't need to call it directly unless building a custom integration.
 
 ## Pre-built binaries
