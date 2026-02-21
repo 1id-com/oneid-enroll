@@ -105,7 +105,7 @@ func validateOutputFilePath(outputFilePath string) error {
 	return nil
 }
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -142,22 +142,26 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, `oneid-enroll -- HSM helper for 1id.com identity SDK
 
 Usage:
-  oneid-enroll detect    [--json]                          Detect available HSMs
-  oneid-enroll extract   [--json] [--elevated]             Extract EK cert + generate AK
-  oneid-enroll activate  [--json] [--elevated]             Decrypt credential challenge
+  oneid-enroll detect    [--json]                          Detect available HSMs (TPM + PIV)
+  oneid-enroll extract   [--json] [--elevated]             Extract attestation data
+                         [--type tpm|yubikey]                tpm: EK cert + AK (needs elevation)
+                                                             yubikey: PIV attestation (no elevation)
+  oneid-enroll activate  [--json] [--elevated]             Decrypt credential challenge (TPM only)
                          --credential-blob <b64>
                          --encrypted-secret <b64>
                          --ak-handle <hex>
   oneid-enroll sign      [--json]                          Sign a challenge nonce (NO elevation)
                          --nonce <b64>
-                         --ak-handle <hex>
-  oneid-enroll session   [--elevated] [--pipe <name>]      Interactive session (one UAC)
+                         [--type tpm|yubikey]                tpm: requires --ak-handle
+                         [--ak-handle <hex>]                 yubikey: uses slot 9a automatically
+  oneid-enroll session   [--elevated] [--pipe <name>]      Interactive session (one UAC, TPM only)
   oneid-enroll version   [--json]                          Print version
   oneid-enroll help                                        Print this help
 
 Flags:
   --json       Output JSON to stdout (for SDK consumption)
   --elevated   Trigger UAC/sudo if not already running as admin
+  --type       HSM type: tpm (default) or yubikey
   --pipe       Named pipe for session I/O (Windows; Linux/macOS uses stdin/stdout)`)
 }
 
@@ -274,6 +278,8 @@ func runExtract(args []string) {
 	switch *hsmType {
 	case "tpm":
 		runExtractTPM(*jsonOutput)
+	case "yubikey", "piv":
+		runExtractPIV(*jsonOutput)
 	default:
 		if *jsonOutput {
 			protocol.ErrorResponse("UNSUPPORTED_HSM", fmt.Sprintf("HSM type '%s' is not yet supported for extraction", *hsmType))
@@ -381,6 +387,43 @@ func runExtractTPM(jsonOutput bool) {
 		protocol.HumanMessage("  Handle:      %s", akData.Handle)
 		protocol.HumanMessage("  Algorithm:   %s", akData.KeyAlgorithm)
 		protocol.HumanMessage("  TPM Name:    %s", akData.TPMName)
+	}
+}
+
+// runExtractPIV generates (or reuses) a PIV key and extracts attestation data.
+//
+// This is the YubiKey equivalent of runExtractTPM. Instead of EK+AK, it uses
+// PIV attestation certificates to prove the key lives on genuine Yubico hardware.
+//
+// NO ELEVATION REQUIRED: PIV operations go through PCSC, not privileged
+// hardware interfaces. With pin-policy=NEVER, no human interaction needed.
+func runExtractPIV(jsonOutput bool) {
+	piv_extract_result, err := piv.ExtractPIVAttestationAndEnsureKeyExists(piv.DefaultManagementKey)
+	if err != nil {
+		if jsonOutput {
+			protocol.ErrorResponse("HSM_ACCESS_ERROR", fmt.Sprintf("PIV extraction failed: %v", err))
+		} else {
+			protocol.HumanMessage("Error: PIV extraction failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if jsonOutput {
+		protocol.SuccessResponse(piv_extract_result)
+	} else {
+		generated_or_reused_label := "Existing key reused"
+		if piv_extract_result.KeyWasNewlyGenerated {
+			generated_or_reused_label = "New key generated"
+		}
+		protocol.HumanMessage("PIV attestation extracted successfully")
+		protocol.HumanMessage("  Serial:       %s", piv_extract_result.SerialNumber)
+		protocol.HumanMessage("  Firmware:     %s", piv_extract_result.FirmwareVersion)
+		protocol.HumanMessage("  Slot:         %s", piv_extract_result.SlotName)
+		protocol.HumanMessage("  Algorithm:    %s", piv_extract_result.Algorithm)
+		protocol.HumanMessage("  PIN policy:   %s", piv_extract_result.PINPolicy)
+		protocol.HumanMessage("  Touch policy: %s", piv_extract_result.TouchPolicy)
+		protocol.HumanMessage("  Key status:   %s", generated_or_reused_label)
 	}
 }
 
@@ -515,41 +558,65 @@ func runActivate(args []string) {
 	}
 }
 
-// runSign signs a challenge nonce using the persistent AK.
+// runSign signs a challenge nonce using a hardware-backed key.
 //
-// NO ELEVATION REQUIRED. The AK has UserWithAuth=true, so TPM2_Sign
-// works at normal user privilege. This is the core of ongoing TPM-backed
-// authentication -- agents sign server-provided nonces to prove they
-// still control the same hardware.
+// For TPM: uses the persistent AK. NO ELEVATION REQUIRED (UserWithAuth=true).
+// For PIV/YubiKey: uses the slot 9a key. NO ELEVATION REQUIRED (pin-policy=NEVER).
+//
+// This is the core of ongoing hardware-backed authentication -- agents sign
+// server-provided nonces to prove they still control the same hardware.
 func runSign(args []string) {
 	flags := flag.NewFlagSet("sign", flag.ExitOnError)
 	jsonOutput := flags.Bool("json", false, "output JSON")
 	nonceB64 := flags.String("nonce", "", "base64-encoded nonce from server")
-	akHandleStr := flags.String("ak-handle", "", "AK persistent handle (hex, e.g. 0x81000100)")
+	akHandleStr := flags.String("ak-handle", "", "AK persistent handle (hex, e.g. 0x81000100) [TPM only]")
+	hsmType := flags.String("type", "tpm", "HSM type: tpm or yubikey")
 	flags.Parse(args)
 
-	// Validate required arguments
-	if *nonceB64 == "" || *akHandleStr == "" {
-		missingArgs := ""
-		if *nonceB64 == "" { missingArgs += " --nonce" }
-		if *akHandleStr == "" { missingArgs += " --ak-handle" }
+	if *nonceB64 == "" {
 		if *jsonOutput {
-			protocol.ErrorResponse("MISSING_ARGUMENT", fmt.Sprintf("Required arguments:%s", missingArgs))
+			protocol.ErrorResponse("MISSING_ARGUMENT", "Required argument: --nonce")
 		} else {
-			protocol.HumanMessage("Error: required arguments:%s", missingArgs)
+			protocol.HumanMessage("Error: required argument: --nonce")
 			os.Exit(1)
 		}
 		return
 	}
 
-	// Parse AK handle
-	akHandleClean := strings.TrimPrefix(strings.TrimPrefix(*akHandleStr, "0x"), "0X")
+	switch *hsmType {
+	case "yubikey", "piv":
+		runSignPIV(*jsonOutput, *nonceB64)
+	case "tpm":
+		runSignTPM(*jsonOutput, *nonceB64, *akHandleStr)
+	default:
+		if *jsonOutput {
+			protocol.ErrorResponse("UNSUPPORTED_HSM", fmt.Sprintf("HSM type '%s' is not supported for signing", *hsmType))
+		} else {
+			protocol.HumanMessage("HSM type '%s' is not supported for signing", *hsmType)
+			os.Exit(1)
+		}
+	}
+}
+
+// runSignTPM signs a nonce with the TPM's persistent AK.
+func runSignTPM(jsonOutput bool, nonceB64 string, akHandleStr string) {
+	if akHandleStr == "" {
+		if jsonOutput {
+			protocol.ErrorResponse("MISSING_ARGUMENT", "Required argument for TPM signing: --ak-handle")
+		} else {
+			protocol.HumanMessage("Error: required argument for TPM signing: --ak-handle")
+			os.Exit(1)
+		}
+		return
+	}
+
+	akHandleClean := strings.TrimPrefix(strings.TrimPrefix(akHandleStr, "0x"), "0X")
 	akHandleVal, err := strconv.ParseUint(akHandleClean, 16, 32)
 	if err != nil {
-		if *jsonOutput {
-			protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf("Invalid AK handle '%s': %v", *akHandleStr, err))
+		if jsonOutput {
+			protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf("Invalid AK handle '%s': %v", akHandleStr, err))
 		} else {
-			protocol.HumanMessage("Error: invalid AK handle '%s': %v", *akHandleStr, err)
+			protocol.HumanMessage("Error: invalid AK handle '%s': %v", akHandleStr, err)
 			os.Exit(1)
 		}
 		return
@@ -557,7 +624,7 @@ func runSign(args []string) {
 
 	// SECURITY: Validate AK handle is within our expected range
 	if akHandleVal < 0x81000100 || akHandleVal > 0x810001FF {
-		if *jsonOutput {
+		if jsonOutput {
 			protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf(
 				"AK handle 0x%08X is outside the allowed range 0x81000100-0x810001FF", akHandleVal))
 		} else {
@@ -567,10 +634,9 @@ func runSign(args []string) {
 		return
 	}
 
-	// Open TPM -- NO elevation needed for TPM2_Sign with UserWithAuth key
 	tpmDevice, err := transport.OpenTPM()
 	if err != nil {
-		if *jsonOutput {
+		if jsonOutput {
 			protocol.ErrorResponse("NO_HSM_FOUND", fmt.Sprintf("Could not open TPM: %v", err))
 		} else {
 			protocol.HumanMessage("Error: Could not open TPM: %v", err)
@@ -580,9 +646,9 @@ func runSign(args []string) {
 	}
 	defer tpmDevice.Close()
 
-	result, err := tpm.SignChallengeWithAK(tpmDevice, uint32(akHandleVal), *nonceB64)
+	result, err := tpm.SignChallengeWithAK(tpmDevice, uint32(akHandleVal), nonceB64)
 	if err != nil {
-		if *jsonOutput {
+		if jsonOutput {
 			protocol.ErrorResponse("SIGN_FAILED", fmt.Sprintf("TPM signing failed: %v", err))
 		} else {
 			protocol.HumanMessage("Error: TPM signing failed: %v", err)
@@ -591,13 +657,40 @@ func runSign(args []string) {
 		return
 	}
 
-	if *jsonOutput {
+	if jsonOutput {
 		protocol.SuccessResponse(result)
 	} else {
 		protocol.HumanMessage("Challenge signed successfully")
 		protocol.HumanMessage("  Algorithm:  %s", result.Algorithm)
 		protocol.HumanMessage("  AK Handle:  %s", result.AKHandle)
 		protocol.HumanMessage("  Signature:  %s... (%d chars)", result.SignatureBase64[:40], len(result.SignatureBase64))
+	}
+}
+
+// runSignPIV signs a nonce with the PIV key in slot 9a.
+func runSignPIV(jsonOutput bool, nonceB64 string) {
+	result, err := piv.SignChallengeWithPIVKey(nonceB64)
+	if err != nil {
+		if jsonOutput {
+			protocol.ErrorResponse("SIGN_FAILED", fmt.Sprintf("PIV signing failed: %v", err))
+		} else {
+			protocol.HumanMessage("Error: PIV signing failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if jsonOutput {
+		protocol.SuccessResponse(result)
+	} else {
+		protocol.HumanMessage("Challenge signed successfully (PIV)")
+		protocol.HumanMessage("  Algorithm:    %s", result.Algorithm)
+		protocol.HumanMessage("  Serial:       %s", result.SerialNumber)
+		signature_preview_length := 40
+		if len(result.SignatureBase64) < signature_preview_length {
+			signature_preview_length = len(result.SignatureBase64)
+		}
+		protocol.HumanMessage("  Signature:    %s... (%d chars)", result.SignatureBase64[:signature_preview_length], len(result.SignatureBase64))
 	}
 }
 
