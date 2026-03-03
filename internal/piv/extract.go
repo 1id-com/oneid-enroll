@@ -69,7 +69,7 @@ func encode_ecdsa_public_key_to_pem_string(public_key *ecdsa.PublicKey) (string,
 
 // ExtractPIVAttestationAndEnsureKeyExists opens the first available PIV device,
 // ensures a signing key exists in slot 9a, and returns the attestation data
-// needed for sovereign-portable enrollment.
+// needed for portable tier enrollment.
 //
 // If slot 9a is empty, a new ECCP256 key is generated with pin-policy=NEVER
 // and touch-policy=NEVER (critical for autonomous agent operation).

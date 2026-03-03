@@ -30,10 +30,13 @@ import (
 	"strconv"
 	"strings"
 
+	"runtime"
+
 	"github.com/1id-com/oneid-enroll/internal/elevate"
 	"github.com/1id-com/oneid-enroll/internal/piv"
 	"github.com/1id-com/oneid-enroll/internal/protocol"
 	"github.com/1id-com/oneid-enroll/internal/session"
+	"github.com/1id-com/oneid-enroll/internal/tbs"
 	"github.com/1id-com/oneid-enroll/internal/tpm"
 	"github.com/google/go-tpm/tpm2/transport"
 )
@@ -105,7 +108,7 @@ func validateOutputFilePath(outputFilePath string) error {
 	return nil
 }
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -125,6 +128,8 @@ func main() {
 		runActivate(subArgs)
 	case "sign":
 		runSign(subArgs)
+	case "setup-tbs":
+		runSetupTBS(subArgs)
 	case "session":
 		runSession(subArgs)
 	case "version":
@@ -143,8 +148,9 @@ func printUsage() {
 
 Usage:
   oneid-enroll detect    [--json]                          Detect available HSMs (TPM + PIV)
+  oneid-enroll setup-tbs [--json] [--elevated]             One-time: grant non-admin TBS access (Windows)
   oneid-enroll extract   [--json] [--elevated]             Extract attestation data
-                         [--type tpm|yubikey]                tpm: EK cert + AK (needs elevation)
+                         [--type tpm|yubikey]                tpm: EK cert + AK
                                                              yubikey: PIV attestation (no elevation)
   oneid-enroll activate  [--json] [--elevated]             Decrypt credential challenge (TPM only)
                          --credential-blob <b64>
@@ -163,6 +169,120 @@ Flags:
   --elevated   Trigger UAC/sudo if not already running as admin
   --type       HSM type: tpm (default) or yubikey
   --pipe       Named pipe for session I/O (Windows; Linux/macOS uses stdin/stdout)`)
+}
+
+// runSetupTBS configures the Windows registry to allow non-admin users
+// to access TPM Base Services (TBS). This is a one-time operation that
+// requires administrator privileges. After this, all TPM operations
+// (extract, activate, sign) work without elevation.
+//
+// On non-Windows platforms, this is a no-op that reports success.
+func runSetupTBS(args []string) {
+	flags := flag.NewFlagSet("setup-tbs", flag.ExitOnError)
+	jsonOutput := flags.Bool("json", false, "output JSON")
+	wantElevation := flags.Bool("elevated", false, "trigger UAC/sudo")
+	outputFile := flags.String("output-file", "", "write output to file instead of stdout (used by elevation)")
+	alreadyElevated := flags.Bool("_already-elevated", false, "internal: marks process as already elevated")
+	flags.Parse(args)
+
+	if *outputFile != "" {
+		if err := validateOutputFilePath(*outputFile); err != nil {
+			protocol.HumanMessage("SECURITY: rejected output file path: %v", err)
+			os.Exit(1)
+		}
+		f, err := os.Create(*outputFile)
+		if err != nil {
+			protocol.HumanMessage("Error: could not create output file %s: %v", *outputFile, err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		os.Stdout = f
+	}
+
+	if *alreadyElevated {
+		*wantElevation = false
+	}
+
+	if runtime.GOOS != "windows" {
+		if *jsonOutput {
+			protocol.SuccessResponse(map[string]interface{}{
+				"ok":          true,
+				"already_set": true,
+				"platform":    "not_windows",
+				"message":     "TBS configuration is Windows-only; no action needed on " + runtime.GOOS,
+			})
+		} else {
+			protocol.HumanMessage("TBS configuration is Windows-only. No action needed on %s.", runtime.GOOS)
+		}
+		return
+	}
+
+	tbs_access_is_already_configured, err := tbs.CheckTBSAccessIsGrantedToNonAdminUsers()
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("TBS_CHECK_FAILED", fmt.Sprintf("Could not check TBS registry state: %v", err))
+		} else {
+			protocol.HumanMessage("Error: could not check TBS registry state: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if tbs_access_is_already_configured {
+		if *jsonOutput {
+			protocol.SuccessResponse(map[string]interface{}{
+				"ok":          true,
+				"already_set": true,
+			})
+		} else {
+			protocol.HumanMessage("TBS access is already configured for non-admin users. No changes needed.")
+		}
+		return
+	}
+
+	if *wantElevation && !elevate.IsRunningElevated() {
+		protocol.HumanMessage("Requesting administrator privileges to set TBS registry key...")
+		if err := elevate.RelaunchElevated(); err != nil {
+			if *jsonOutput {
+				protocol.ErrorResponse("UAC_DENIED", err.Error())
+			} else {
+				protocol.HumanMessage("Elevation failed: %v", err)
+				os.Exit(1)
+			}
+		}
+		return
+	}
+
+	if !elevate.IsRunningElevated() {
+		if *jsonOutput {
+			protocol.ErrorResponse("TBS_ACCESS_NOT_CONFIGURED",
+				"TBS access is not configured for non-admin users. Run with --elevated to set the registry key.")
+		} else {
+			protocol.HumanMessage("Error: TBS access is not configured. Run with --elevated to set the registry key.")
+			os.Exit(1)
+		}
+		return
+	}
+
+	if err := tbs.GrantTBSAccessToNonAdminUsersViaRegistryKey(); err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("TBS_SET_FAILED", fmt.Sprintf("Could not set TBS registry key: %v", err))
+		} else {
+			protocol.HumanMessage("Error: could not set TBS registry key: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *jsonOutput {
+		protocol.SuccessResponse(map[string]interface{}{
+			"ok":          true,
+			"already_set": false,
+		})
+	} else {
+		protocol.HumanMessage("TBS access configured successfully. Non-admin users can now access the TPM.")
+		protocol.HumanMessage("All future TPM operations (extract, activate, sign) will work without elevation.")
+	}
 }
 
 // runDetect scans for available HSMs (no elevation required).
@@ -318,6 +438,19 @@ func runExtractTPM(jsonOutput bool) {
 	// Open TPM
 	tpmDevice, err := transport.OpenTPM()
 	if err != nil {
+		tbs_access_is_configured, _ := tbs.CheckTBSAccessIsGrantedToNonAdminUsers()
+		if !tbs_access_is_configured && !elevate.IsRunningElevated() {
+			if jsonOutput {
+				protocol.ErrorResponse("TBS_ACCESS_DENIED",
+					"TPM detected but TBS access is not configured for non-admin users. "+
+						"Run 'oneid-enroll setup-tbs --elevated --json' first (one-time setup).")
+			} else {
+				protocol.HumanMessage("Error: TPM access denied. TBS is not configured for non-admin users.")
+				protocol.HumanMessage("Run: oneid-enroll setup-tbs --elevated")
+				os.Exit(1)
+			}
+			return
+		}
 		if jsonOutput {
 			protocol.ErrorResponse("NO_HSM_FOUND", fmt.Sprintf("Could not open TPM: %v", err))
 		} else {
@@ -522,6 +655,19 @@ func runActivate(args []string) {
 	// Open the TPM
 	tpmDevice, err := transport.OpenTPM()
 	if err != nil {
+		tbs_access_is_configured, _ := tbs.CheckTBSAccessIsGrantedToNonAdminUsers()
+		if !tbs_access_is_configured && !elevate.IsRunningElevated() {
+			if *jsonOutput {
+				protocol.ErrorResponse("TBS_ACCESS_DENIED",
+					"TPM detected but TBS access is not configured for non-admin users. "+
+						"Run 'oneid-enroll setup-tbs --elevated --json' first (one-time setup).")
+			} else {
+				protocol.HumanMessage("Error: TPM access denied. TBS is not configured for non-admin users.")
+				protocol.HumanMessage("Run: oneid-enroll setup-tbs --elevated")
+				os.Exit(1)
+			}
+			return
+		}
 		if *jsonOutput {
 			protocol.ErrorResponse("NO_HSM_FOUND", fmt.Sprintf("Could not open TPM: %v", err))
 		} else {
