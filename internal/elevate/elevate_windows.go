@@ -34,6 +34,94 @@ func isRunningElevatedWindows() bool {
 	return member
 }
 
+// RunSubcommandElevated launches a specific subcommand of this binary
+// with elevated privileges (UAC), waits for it to complete, and RETURNS
+// the exit code and captured output. Unlike RelaunchElevated, this does
+// NOT terminate the calling process -- the caller can inspect the result
+// and continue execution (e.g., retry a TPM operation after setup-tbs).
+//
+// On non-Windows platforms this always returns an error (elevation
+// is handled differently and TBS does not exist).
+func RunSubcommandElevated(subcommand_args []string) (exit_code uint32, captured_output []byte, err error) {
+	executable_path, err := os.Executable()
+	if err != nil {
+		return 1, nil, fmt.Errorf("could not determine executable path: %w", err)
+	}
+
+	temp_file, err := os.CreateTemp("", "oneid-elevated-*.json")
+	if err != nil {
+		return 1, nil, fmt.Errorf("could not create temp file for elevated output: %w", err)
+	}
+	output_file_path := temp_file.Name()
+	temp_file.Close()
+	defer os.Remove(output_file_path)
+
+	elevated_args := append(subcommand_args, AlreadyElevatedFlag, "--output-file", output_file_path)
+	args_str := strings.Join(elevated_args, " ")
+
+	shell32 := windows.NewLazySystemDLL("shell32.dll")
+	shellExecuteExW := shell32.NewProc("ShellExecuteExW")
+
+	type SHELLEXECUTEINFO struct {
+		cbSize       uint32
+		fMask        uint32
+		hwnd         uintptr
+		lpVerb       *uint16
+		lpFile       *uint16
+		lpParameters *uint16
+		lpDirectory  *uint16
+		nShow        int32
+		hInstApp     uintptr
+		lpIDList     uintptr
+		lpClass      *uint16
+		hkeyClass    uintptr
+		dwHotKey     uint32
+		hIcon        uintptr
+		hProcess     uintptr
+	}
+
+	const SEE_MASK_NOCLOSEPROCESS = 0x00000040
+	const SW_HIDE = 0
+
+	verb, _ := windows.UTF16PtrFromString("runas")
+	file, _ := windows.UTF16PtrFromString(executable_path)
+	params, _ := windows.UTF16PtrFromString(args_str)
+	dir, _ := windows.UTF16PtrFromString("")
+
+	sei := SHELLEXECUTEINFO{
+		fMask:        SEE_MASK_NOCLOSEPROCESS,
+		lpVerb:       verb,
+		lpFile:       file,
+		lpParameters: params,
+		lpDirectory:  dir,
+		nShow:        SW_HIDE,
+	}
+	sei.cbSize = uint32(unsafe.Sizeof(sei))
+
+	ret, _, call_err := shellExecuteExW.Call(uintptr(unsafe.Pointer(&sei)))
+	if ret == 0 {
+		return 1, nil, fmt.Errorf("UAC elevation denied or ShellExecuteEx failed: %v", call_err)
+	}
+
+	exit_code = 0
+	if sei.hProcess != 0 {
+		handle := windows.Handle(sei.hProcess)
+		windows.WaitForSingleObject(handle, windows.INFINITE)
+		windows.GetExitCodeProcess(handle, &exit_code)
+		windows.CloseHandle(handle)
+	}
+
+	output_data, read_err := os.ReadFile(output_file_path)
+	if read_err != nil {
+		output_data = nil
+	}
+
+	if exit_code != 0 {
+		return exit_code, output_data, fmt.Errorf("elevated subcommand exited with code %d", exit_code)
+	}
+	return 0, output_data, nil
+}
+
 // relaunchElevatedWindows uses ShellExecuteExW with "runas" verb for UAC.
 //
 // Since ShellExecuteEx creates a NEW console for the elevated process,

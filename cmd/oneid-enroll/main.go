@@ -108,7 +108,7 @@ func validateOutputFilePath(outputFilePath string) error {
 	return nil
 }
 
-const version = "0.3.0"
+const version = "0.3.1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -381,7 +381,35 @@ func runExtract(args []string) {
 		*wantElevation = false // Don't try to elevate again -- we already are
 	}
 
-	// Handle elevation: only if --elevated was passed AND we're not already elevated
+	// On Windows for TPM: try accessing the TPM at current privilege level
+	// first. If it works, no elevation needed. If it fails because TBS is
+	// not configured, run setup-tbs (one UAC) then retry. This gives:
+	//   - 0 UAC prompts when TBS was previously configured
+	//   - 1 UAC prompt on first-ever use (to set the TBS registry key)
+	//   - Never 2+ prompts
+	if *wantElevation && !elevate.IsRunningElevated() && runtime.GOOS == "windows" && (*hsmType == "tpm" || *hsmType == "") {
+		tpm_probe, tpm_probe_err := transport.OpenTPM()
+		if tpm_probe_err == nil {
+			tpm_probe.Close()
+			protocol.HumanMessage("TPM accessible without elevation -- skipping UAC")
+			*wantElevation = false
+		} else {
+			tbs_is_configured, _ := tbs.CheckTBSAccessIsGrantedToNonAdminUsers()
+			if !tbs_is_configured {
+				protocol.HumanMessage("TPM not accessible -- configuring TBS for non-admin access (one-time setup)...")
+				exit_code, _, setup_err := elevate.RunSubcommandElevated([]string{"setup-tbs", "--json"})
+				if setup_err == nil && exit_code == 0 {
+					tpm_retry, retry_err := transport.OpenTPM()
+					if retry_err == nil {
+						tpm_retry.Close()
+						protocol.HumanMessage("TBS configured -- TPM now accessible without elevation")
+						*wantElevation = false
+					}
+				}
+			}
+		}
+	}
+
 	if *wantElevation && !elevate.IsRunningElevated() {
 		protocol.HumanMessage("Requesting administrator privileges...")
 		if err := elevate.RelaunchElevated(); err != nil {
@@ -638,7 +666,32 @@ func runActivate(args []string) {
 		return
 	}
 
-	// Handle elevation
+	// On Windows: try the TPM at current privilege level first.
+	// If it works, no elevation needed. If TBS is the issue, set it up
+	// (one UAC) and retry. Same pattern as runExtract.
+	if *wantElevation && !elevate.IsRunningElevated() && runtime.GOOS == "windows" {
+		tpm_probe, tpm_probe_err := transport.OpenTPM()
+		if tpm_probe_err == nil {
+			tpm_probe.Close()
+			protocol.HumanMessage("TPM accessible without elevation -- skipping UAC")
+			*wantElevation = false
+		} else {
+			tbs_is_configured, _ := tbs.CheckTBSAccessIsGrantedToNonAdminUsers()
+			if !tbs_is_configured {
+				protocol.HumanMessage("TPM not accessible -- configuring TBS for non-admin access (one-time setup)...")
+				exit_code, _, setup_err := elevate.RunSubcommandElevated([]string{"setup-tbs", "--json"})
+				if setup_err == nil && exit_code == 0 {
+					tpm_retry, retry_err := transport.OpenTPM()
+					if retry_err == nil {
+						tpm_retry.Close()
+						protocol.HumanMessage("TBS configured -- TPM now accessible without elevation")
+						*wantElevation = false
+					}
+				}
+			}
+		}
+	}
+
 	if *wantElevation && !elevate.IsRunningElevated() {
 		protocol.HumanMessage("Requesting administrator privileges...")
 		if err := elevate.RelaunchElevated(); err != nil {
@@ -861,7 +914,30 @@ func runSession(args []string) {
 		*wantElevation = false
 	}
 
-	// Handle elevation
+	// On Windows: try TPM at current privilege first, setup TBS if needed.
+	if *wantElevation && !elevate.IsRunningElevated() && runtime.GOOS == "windows" {
+		tpm_probe, tpm_probe_err := transport.OpenTPM()
+		if tpm_probe_err == nil {
+			tpm_probe.Close()
+			protocol.HumanMessage("TPM accessible without elevation -- skipping UAC")
+			*wantElevation = false
+		} else {
+			tbs_is_configured, _ := tbs.CheckTBSAccessIsGrantedToNonAdminUsers()
+			if !tbs_is_configured {
+				protocol.HumanMessage("TPM not accessible -- configuring TBS for non-admin access (one-time setup)...")
+				exit_code, _, setup_err := elevate.RunSubcommandElevated([]string{"setup-tbs", "--json"})
+				if setup_err == nil && exit_code == 0 {
+					tpm_retry, retry_err := transport.OpenTPM()
+					if retry_err == nil {
+						tpm_retry.Close()
+						protocol.HumanMessage("TBS configured -- TPM now accessible without elevation")
+						*wantElevation = false
+					}
+				}
+			}
+		}
+	}
+
 	if *wantElevation && !elevate.IsRunningElevated() {
 		protocol.HumanMessage("Requesting administrator privileges...")
 		if err := elevate.RelaunchElevated(); err != nil {
