@@ -108,7 +108,7 @@ func validateOutputFilePath(outputFilePath string) error {
 	return nil
 }
 
-const version = "0.4.0"
+const version = "0.4.1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -167,9 +167,9 @@ Usage:
                          [--output-clock]                    (tpm only) also TPM Quote for clock capture
   oneid-enroll piv-sign  [--json]                          Sign arbitrary data with PIV slot 9a
                          --data <b64>
-  oneid-enroll tpm-bind-quote [--json]                     Extend PCR + Quote for co-location binding
-                         --extend-pcr <num>
-                         --extend-data <b64>
+  oneid-enroll tpm-bind-quote [--json] [--elevated]         Extend PCR + Quote for co-location binding
+                         --extend-pcr <num>                  (Windows: --elevated required; PCR_Extend
+                         --extend-data <b64>                  is blocked by TBS for standard users)
                          --qualifying-data <b64>
                          --ak-handle <hex>
   oneid-enroll session   [--elevated] [--pipe <name>]      Interactive session (one UAC, TPM only)
@@ -1089,16 +1089,45 @@ func runPIVSignArbitraryData(args []string) {
 // TPM Quote. This is Phase 3 of co-location binding: extend PCR 16
 // with SHA256(S2), then quote with qualifying data = (N1 || S1 || S2).
 //
-// No elevation required: PCR 16 is application-use and extendable from
-// locality 0 with empty auth (TBS provides locality 0 on Windows).
+// Windows elevation: PCR_Extend is on the TBS default blocked command
+// list for standard users. Starting with Windows 10 1809, this list is
+// fixed in the TPM driver and CANNOT be unblocked via registry settings
+// (IgnoreDefaultList has no effect on TPM 2.0 commands). Elevation is
+// required on Windows. The binary is code-signed, so the UAC dialog
+// shows a verified publisher.
+//
+// Linux/macOS: PCR_Extend works without elevation (no TBS filtering).
 func runTPMBindQuote(args []string) {
 	flags := flag.NewFlagSet("tpm-bind-quote", flag.ExitOnError)
 	jsonOutput := flags.Bool("json", false, "output JSON")
+	wantElevation := flags.Bool("elevated", false, "trigger UAC/sudo for PCR_Extend (required on Windows)")
 	extendPCR := flags.Int("extend-pcr", 16, "PCR index to extend")
 	extendDataB64 := flags.String("extend-data", "", "base64-encoded SHA-256 hash to extend into the PCR")
 	qualifyingDataB64 := flags.String("qualifying-data", "", "base64-encoded qualifying data for the Quote")
 	akHandleStr := flags.String("ak-handle", "", "AK persistent handle (hex, e.g. 0x81000100)")
+	outputFile := flags.String("output-file", "", "write output to file instead of stdout (used by elevation)")
+	alreadyElevated := flags.Bool("_already-elevated", false, "internal: marks process as already elevated")
 	flags.Parse(args)
+
+	if *wantElevation && !*alreadyElevated && !elevate.IsRunningElevated() {
+		if err := elevate.RelaunchElevated(); err != nil {
+			if *jsonOutput {
+				protocol.ErrorResponse("ELEVATION_FAILED", fmt.Sprintf("Could not elevate: %v", err))
+			} else {
+				protocol.HumanMessage("Error: could not elevate: %v", err)
+				os.Exit(1)
+			}
+			return
+		}
+	}
+
+	if *outputFile != "" {
+		f, err := os.Create(*outputFile)
+		if err == nil {
+			os.Stdout = f
+			defer f.Close()
+		}
+	}
 
 	if *extendDataB64 == "" || *qualifyingDataB64 == "" || *akHandleStr == "" {
 		missingArgs := ""
