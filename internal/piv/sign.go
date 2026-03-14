@@ -18,6 +18,7 @@ import (
   "crypto/rand"
   "crypto/sha256"
   "encoding/base64"
+  "encoding/pem"
   "errors"
   "fmt"
 
@@ -122,6 +123,113 @@ func SignChallengeWithPIVKey(nonce_base64 string) (*PIVSignChallengeResult, erro
     SignatureBase64: signature_base64,
     Algorithm:       "ECDSA-SHA256",
     SerialNumber:    fmt.Sprintf("%d", device_serial_number),
+  }, nil
+}
+
+// PIVArbitraryDataSignResult holds the output of signing arbitrary data
+// with the PIV key, used in co-location binding Phase 2.
+type PIVArbitraryDataSignResult struct {
+  S2SignatureBase64        string `json:"s2_signature_b64"`
+  PIVAttestationCertPEM    string `json:"piv_attestation_cert_pem"`
+  PIVDeviceSerial          string `json:"piv_device_serial"`
+  Algorithm                string `json:"algorithm"`
+}
+
+// SignArbitraryDataWithPIVKey signs arbitrary base64-encoded data with
+// the PIV key in slot 9a. The input is hashed with SHA-256 then signed
+// with ECDSA-P256.
+//
+// This is used in co-location binding: the caller passes base64(N1 || S1)
+// and gets back S2, which proves the PIV device was present.
+//
+// Also returns the slot 9a attestation certificate, which the server
+// uses to verify the signature came from genuine hardware.
+func SignArbitraryDataWithPIVKey(data_base64 string) (*PIVArbitraryDataSignResult, error) {
+  data_bytes, err := base64.StdEncoding.DecodeString(data_base64)
+  if err != nil {
+    return nil, fmt.Errorf("invalid base64 data: %w", err)
+  }
+  if len(data_bytes) == 0 {
+    return nil, fmt.Errorf("data must not be empty")
+  }
+
+  yubikey_connection, _, err := OpenFirstAvailablePIVDevice()
+  if err != nil {
+    return nil, err
+  }
+  defer yubikey_connection.Close()
+
+  device_serial_number, err := yubikey_connection.Serial()
+  if err != nil {
+    return nil, fmt.Errorf("could not read device serial number: %w", err)
+  }
+
+  slot_9a := gopiv.SlotAuthentication
+  var signing_public_key *ecdsa.PublicKey
+
+  stored_cert, cert_err := yubikey_connection.Certificate(slot_9a)
+  if cert_err == nil {
+    ecdsa_key, ok := stored_cert.PublicKey.(*ecdsa.PublicKey)
+    if ok {
+      signing_public_key = ecdsa_key
+    }
+  }
+
+  if signing_public_key == nil {
+    attest_cert, attest_err := yubikey_connection.Attest(slot_9a)
+    if attest_err != nil {
+      return nil, fmt.Errorf("no key found in slot 9a: %w", attest_err)
+    }
+    ecdsa_key, ok := attest_cert.PublicKey.(*ecdsa.PublicKey)
+    if !ok {
+      return nil, fmt.Errorf("slot 9a key is not ECDSA (got %T)", attest_cert.PublicKey)
+    }
+    signing_public_key = ecdsa_key
+  }
+
+  if signing_public_key.Curve != elliptic.P256() {
+    return nil, fmt.Errorf("expected P-256 key in slot 9a, got %s", signing_public_key.Curve.Params().Name)
+  }
+
+  private_key_interface, err := yubikey_connection.PrivateKey(
+    slot_9a,
+    signing_public_key,
+    gopiv.KeyAuth{},
+  )
+  if err != nil {
+    return nil, fmt.Errorf("could not get private key handle for slot 9a: %w", err)
+  }
+
+  hardware_signer, ok := private_key_interface.(crypto.Signer)
+  if !ok {
+    return nil, fmt.Errorf("private key does not implement crypto.Signer")
+  }
+
+  data_sha256_hash := sha256.Sum256(data_bytes)
+  der_signature_bytes, err := hardware_signer.Sign(rand.Reader, data_sha256_hash[:], crypto.SHA256)
+  if err != nil {
+    return nil, fmt.Errorf("PIV signing failed: %w", err)
+  }
+
+  if !ecdsa.VerifyASN1(signing_public_key, data_sha256_hash[:], der_signature_bytes) {
+    return nil, errors.New("CRITICAL: locally generated signature failed self-verification")
+  }
+
+  // Get attestation cert for this slot (proves key is on genuine hardware)
+  attestation_cert_pem := ""
+  attest_cert, attest_err := yubikey_connection.Attest(slot_9a)
+  if attest_err == nil {
+    attestation_cert_pem = string(pem.EncodeToMemory(&pem.Block{
+      Type:  "CERTIFICATE",
+      Bytes: attest_cert.Raw,
+    }))
+  }
+
+  return &PIVArbitraryDataSignResult{
+    S2SignatureBase64:     base64.StdEncoding.EncodeToString(der_signature_bytes),
+    PIVAttestationCertPEM: attestation_cert_pem,
+    PIVDeviceSerial:       fmt.Sprintf("%d", device_serial_number),
+    Algorithm:             "ECDSA-SHA256",
   }, nil
 }
 
