@@ -1,28 +1,29 @@
-## What's new
+## What's new in v0.5.0
 
-### New subcommands for TPM/PIV co-location binding
+### Transient AK Architecture
+- TPM Attestation Keys are now created on-demand and never persisted via `EvictControl`. This eliminates the need for `setup-tbs` in most cases and avoids NV storage exhaustion. AKs are recreated for each signing operation using deterministic parameters.
 
-- **`sign --output-clock`** — Extends the existing `sign` subcommand to also perform a TPM Quote capturing clock/reset/restart counters (C1 in the binding protocol).
-- **`piv-sign --data <b64>`** — Signs arbitrary base64-encoded data with the PIV key in slot 9a (ECDSA-SHA256). Used in Phase 2 of co-location binding to produce S2.
-- **`tpm-bind-quote`** — Extends PCR 16 with provided data and performs a TPM Quote with qualifying data. Used in Phase 3 of co-location binding.
+### Hardware-Based Identity Recovery
+- When `credentials.json` is lost, the bound hardware (TPM or YubiKey) can prove the agent's identity through challenge-response authentication. The hardware IS the identity.
 
-### TBS setup improvement
+### Certificate Chain Support (Milestone 9)
+- New `--cert-chain-file` flag on `sign` subcommand outputs the agent's full X.509 certificate chain (agent cert → 1ID intermediate → 1ID root) for offline peer identity verification.
 
-- `setup-tbs` now also sets `HKLM\SOFTWARE\Policies\Microsoft\TPM\IgnoreDefaultList = 1`, which bypasses the Windows TBS default blocked command list. This allows `PCR_Extend` (used by `tpm-bind-quote`) to work without elevation.
+### Milestone 10: Hardware Presence Enforcement
+- `sign` subcommand integrated with the server-side hardware challenge-response flow that rejects bare `client_credentials` for hardware-tier identities.
 
 ### Build
-
-- All 5 platform binaries built with full CGo/PIV support (no stubs)
-- Windows: signed with Certum code-signing certificate
-- macOS (amd64 + arm64): signed and notarized with Apple Developer ID
-- Linux: SHA-256 checksums provided
+- All 5 platform binaries built with full CGo/PIV support
+- Windows: signed with Certum code-signing certificate (SHA-256 + timestamp)
+- macOS (amd64 + arm64): signed with Apple Developer ID + notarized
+- All binaries: SHA-256 checksums with GPG detached signatures
 
 ## Checksums (SHA-256)
 
 ```
-d03d84d050f9ef829284d23d61279c8072bd38c8f7ce72e5855968745ea71844  oneid-enroll-darwin-amd64
-1a867e9d480a7a0de5849a2087f2ad63a480810a44cde758b92904523f9d4e4e  oneid-enroll-darwin-arm64
-c85feea38e4aecef2a42dd8c8c21dc0d811ce7f785361547b13353fc078814be  oneid-enroll-linux-amd64
-d7f4ad85db33761c9c18652464da709f4200b4991686fbbca02bbdbfd7a4c4da  oneid-enroll-linux-arm64
-013805096cd2bf99889cdb17d5a3ca5d9255e35d497ddde3e11b29e523802410  oneid-enroll-windows-amd64.exe
+e405d62fa71499e7d66065190d153cada26fde8a34f23d56493c5f348f899762  oneid-enroll-darwin-amd64
+fe226bfdaa63b7cc3064665ed6421d2e4a80a00bebb3caf594aaa17ab403d9db  oneid-enroll-darwin-arm64
+dc79e77759e7a94a8559af43d491ccf6671ca041a8aa206267371bcdc5cd46a6  oneid-enroll-linux-amd64
+25d8ec83708193eab0e324d934bae233493549776685b10be158f1e00f46db80  oneid-enroll-linux-arm64
+1057a33a2f47aeeb4061cd7bfd629439a928e408e03e5374654dd50794088c43  oneid-enroll-windows-amd64.exe
 ```

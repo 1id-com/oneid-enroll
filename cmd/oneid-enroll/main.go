@@ -108,7 +108,7 @@ func validateOutputFilePath(outputFilePath string) error {
 	return nil
 }
 
-const version = "0.4.1"
+var version = "0.5.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -393,9 +393,11 @@ func runExtract(args []string) {
 		*wantElevation = false // Don't try to elevate again -- we already are
 	}
 
-	// On Windows for TPM: try accessing the TPM at current privilege level
-	// first. If it works, no elevation needed. If it fails because TBS is
-	// not configured, run setup-tbs (one UAC) then retry. This gives:
+	// On Windows for TPM: try accessing the TPM at current privilege level first.
+	// With transient-only AK architecture, CreatePrimary does NOT need elevation
+	// (after one-time TBS setup). So if OpenTPM works, skip UAC entirely.
+	//
+	// Result:
 	//   - 0 UAC prompts when TBS was previously configured
 	//   - 1 UAC prompt on first-ever use (to set the TBS registry key)
 	//   - Never 2+ prompts
@@ -513,12 +515,12 @@ func runExtractTPM(jsonOutput bool) {
 		return
 	}
 
-	// Step 2: Get or generate an AK (Attestation Identity Key).
-	// If a persistent AK already exists in our handle range, reuse it.
-	// Otherwise, create a new one and persist it.
+	// Step 2: Create a transient AK (Attestation Identity Key).
+	// The AK is deterministic: same template + same hierarchy seed = same key
+	// every time on the same TPM. No NV persistence needed (no EvictControl).
 	// The AK is bound to the EK via credential activation -- this binding
 	// proves the AK lives inside the same TPM as the EK.
-	akData, err := tpm.GetOrCreateAK(tpmDevice)
+	akData, err := tpm.CreateTransientAK(tpmDevice)
 	if err != nil {
 		if jsonOutput {
 			protocol.ErrorResponse("HSM_ACCESS_ERROR", fmt.Sprintf("Could not generate AK: %v", err))
@@ -528,6 +530,7 @@ func runExtractTPM(jsonOutput bool) {
 		}
 		return
 	}
+	defer tpm.FlushTransientAK(tpmDevice, akData)
 
 	if jsonOutput {
 		// Combine EK and AK data into a single response for the SDK.
@@ -556,7 +559,7 @@ func runExtractTPM(jsonOutput bool) {
 		protocol.HumanMessage("  Valid:       %s to %s", ekData.NotBefore, ekData.NotAfter)
 		protocol.HumanMessage("  Fingerprint: %s", ekData.Fingerprint)
 		protocol.HumanMessage("")
-		protocol.HumanMessage("AK generated and persisted")
+		protocol.HumanMessage("AK generated (transient, deterministic)")
 		protocol.HumanMessage("  Handle:      %s", akData.Handle)
 		protocol.HumanMessage("  Algorithm:   %s", akData.KeyAlgorithm)
 		protocol.HumanMessage("  TPM Name:    %s", akData.TPMName)
@@ -638,11 +641,10 @@ func runActivate(args []string) {
 	}
 
 	// Validate required arguments
-	if *credentialBlobB64 == "" || *encryptedSecretB64 == "" || *akHandleStr == "" {
+	if *credentialBlobB64 == "" || *encryptedSecretB64 == "" {
 		missingArgs := ""
 		if *credentialBlobB64 == "" { missingArgs += " --credential-blob" }
 		if *encryptedSecretB64 == "" { missingArgs += " --encrypted-secret" }
-		if *akHandleStr == "" { missingArgs += " --ak-handle" }
 		if *jsonOutput {
 			protocol.ErrorResponse("MISSING_ARGUMENT", fmt.Sprintf("Required arguments:%s", missingArgs))
 		} else {
@@ -652,35 +654,38 @@ func runActivate(args []string) {
 		return
 	}
 
-	// Parse AK handle (hex string like "0x81000100")
-	akHandleClean := strings.TrimPrefix(strings.TrimPrefix(*akHandleStr, "0x"), "0X")
-	akHandleVal, err := strconv.ParseUint(akHandleClean, 16, 32)
-	if err != nil {
-		if *jsonOutput {
-			protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf("Invalid AK handle '%s': %v", *akHandleStr, err))
-		} else {
-			protocol.HumanMessage("Error: invalid AK handle '%s': %v", *akHandleStr, err)
-			os.Exit(1)
+	// Parse AK handle if provided (backward compat with persistent AKs).
+	// If empty or "transient", we recreate the AK on-demand (preferred path).
+	use_transient_ak := *akHandleStr == "" || *akHandleStr == "transient"
+	var akHandleVal uint64
+	if !use_transient_ak {
+		akHandleClean := strings.TrimPrefix(strings.TrimPrefix(*akHandleStr, "0x"), "0X")
+		var parse_err error
+		akHandleVal, parse_err = strconv.ParseUint(akHandleClean, 16, 32)
+		if parse_err != nil {
+			if *jsonOutput {
+				protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf("Invalid AK handle '%s': %v", *akHandleStr, parse_err))
+			} else {
+				protocol.HumanMessage("Error: invalid AK handle '%s': %v", *akHandleStr, parse_err)
+				os.Exit(1)
+			}
+			return
 		}
-		return
-	}
-
-	// SECURITY: Validate AK handle is within our expected range (0x81000100-0x810001FF)
-	// to prevent using arbitrary persistent handles.
-	if akHandleVal < 0x81000100 || akHandleVal > 0x810001FF {
-		if *jsonOutput {
-			protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf(
-				"AK handle 0x%08X is outside the allowed range 0x81000100-0x810001FF", akHandleVal))
-		} else {
-			protocol.HumanMessage("Error: AK handle 0x%08X is outside the allowed range", akHandleVal)
-			os.Exit(1)
+		if akHandleVal < 0x81000100 || akHandleVal > 0x810001FF {
+			if *jsonOutput {
+				protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf(
+					"AK handle 0x%08X is outside the allowed range 0x81000100-0x810001FF", akHandleVal))
+			} else {
+				protocol.HumanMessage("Error: AK handle 0x%08X is outside the allowed range", akHandleVal)
+				os.Exit(1)
+			}
+			return
 		}
-		return
 	}
 
 	// On Windows: try the TPM at current privilege level first.
-	// If it works, no elevation needed. If TBS is the issue, set it up
-	// (one UAC) and retry. Same pattern as runExtract.
+	// With transient-only architecture, no elevation is needed for ActivateCredential
+	// (after one-time TBS setup).
 	if *wantElevation && !elevate.IsRunningElevated() && runtime.GOOS == "windows" {
 		tpm_probe, tpm_probe_err := transport.OpenTPM()
 		if tpm_probe_err == nil {
@@ -744,13 +749,23 @@ func runActivate(args []string) {
 	defer tpmDevice.Close()
 
 	// Call TPM2_ActivateCredential to decrypt the server's challenge.
-	// This proves our AK is inside the TPM that owns the EK.
-	result, err := tpm.ActivateCredential(
-		tpmDevice,
-		uint32(akHandleVal),
-		*credentialBlobB64,
-		*encryptedSecretB64,
-	)
+	// Preferred: recreate transient AK (deterministic, no persistent handle needed).
+	// Fallback: use provided persistent handle for backward compat.
+	var result *tpm.ActivateCredentialResult
+	if use_transient_ak {
+		result, err = tpm.ActivateCredentialWithTransientAK(
+			tpmDevice,
+			*credentialBlobB64,
+			*encryptedSecretB64,
+		)
+	} else {
+		result, err = tpm.ActivateCredential(
+			tpmDevice,
+			uint32(akHandleVal),
+			*credentialBlobB64,
+			*encryptedSecretB64,
+		)
+	}
 	if err != nil {
 		if *jsonOutput {
 			protocol.ErrorResponse("ACTIVATE_CREDENTIAL_FAILED", fmt.Sprintf("TPM2_ActivateCredential failed: %v", err))
@@ -783,6 +798,7 @@ func runSign(args []string) {
 	akHandleStr := flags.String("ak-handle", "", "AK persistent handle (hex, e.g. 0x81000100) [TPM only]")
 	hsmType := flags.String("type", "tpm", "HSM type: tpm or yubikey")
 	outputClock := flags.Bool("output-clock", false, "also perform TPM Quote for clock capture [TPM only]")
+	certChainFile := flags.String("cert-chain-file", "", "path to PEM certificate chain file (included in proof bundle output)")
 	flags.Parse(args)
 
 	if *nonceB64 == "" {
@@ -793,6 +809,22 @@ func runSign(args []string) {
 			os.Exit(1)
 		}
 		return
+	}
+
+	// Load certificate chain for proof bundle assembly (optional)
+	var identity_certificate_chain_pem string
+	if *certChainFile != "" {
+		chain_bytes, read_err := os.ReadFile(*certChainFile)
+		if read_err != nil {
+			if *jsonOutput {
+				protocol.ErrorResponse("CERT_CHAIN_READ_ERROR", fmt.Sprintf("Could not read cert chain file: %v", read_err))
+			} else {
+				protocol.HumanMessage("Error: could not read cert chain file: %v", read_err)
+				os.Exit(1)
+			}
+			return
+		}
+		identity_certificate_chain_pem = string(chain_bytes)
 	}
 
 	switch *hsmType {
@@ -806,9 +838,9 @@ func runSign(args []string) {
 			}
 			return
 		}
-		runSignPIV(*jsonOutput, *nonceB64)
+		runSignPIV(*jsonOutput, *nonceB64, identity_certificate_chain_pem)
 	case "tpm":
-		runSignTPM(*jsonOutput, *nonceB64, *akHandleStr, *outputClock)
+		runSignTPM(*jsonOutput, *nonceB64, *akHandleStr, *outputClock, identity_certificate_chain_pem)
 	default:
 		if *jsonOutput {
 			protocol.ErrorResponse("UNSUPPORTED_HSM", fmt.Sprintf("HSM type '%s' is not supported for signing", *hsmType))
@@ -819,41 +851,35 @@ func runSign(args []string) {
 	}
 }
 
-// runSignTPM signs a nonce with the TPM's persistent AK.
+// runSignTPM signs a nonce with the TPM AK.
+// Preferred: recreates transient AK (deterministic). Fallback: persistent handle.
 // When outputClock is true, also performs a TPM Quote for clock capture.
-func runSignTPM(jsonOutput bool, nonceB64 string, akHandleStr string, outputClock bool) {
-	if akHandleStr == "" {
-		if jsonOutput {
-			protocol.ErrorResponse("MISSING_ARGUMENT", "Required argument for TPM signing: --ak-handle")
-		} else {
-			protocol.HumanMessage("Error: required argument for TPM signing: --ak-handle")
-			os.Exit(1)
+func runSignTPM(jsonOutput bool, nonceB64 string, akHandleStr string, outputClock bool, identity_certificate_chain_pem string) {
+	use_transient_ak := akHandleStr == "" || akHandleStr == "transient"
+	var akHandleVal uint64
+	if !use_transient_ak {
+		akHandleClean := strings.TrimPrefix(strings.TrimPrefix(akHandleStr, "0x"), "0X")
+		var parse_err error
+		akHandleVal, parse_err = strconv.ParseUint(akHandleClean, 16, 32)
+		if parse_err != nil {
+			if jsonOutput {
+				protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf("Invalid AK handle '%s': %v", akHandleStr, parse_err))
+			} else {
+				protocol.HumanMessage("Error: invalid AK handle '%s': %v", akHandleStr, parse_err)
+				os.Exit(1)
+			}
+			return
 		}
-		return
-	}
-
-	akHandleClean := strings.TrimPrefix(strings.TrimPrefix(akHandleStr, "0x"), "0X")
-	akHandleVal, err := strconv.ParseUint(akHandleClean, 16, 32)
-	if err != nil {
-		if jsonOutput {
-			protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf("Invalid AK handle '%s': %v", akHandleStr, err))
-		} else {
-			protocol.HumanMessage("Error: invalid AK handle '%s': %v", akHandleStr, err)
-			os.Exit(1)
+		if akHandleVal < 0x81000100 || akHandleVal > 0x810001FF {
+			if jsonOutput {
+				protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf(
+					"AK handle 0x%08X is outside the allowed range 0x81000100-0x810001FF", akHandleVal))
+			} else {
+				protocol.HumanMessage("Error: AK handle 0x%08X is outside the allowed range", akHandleVal)
+				os.Exit(1)
+			}
+			return
 		}
-		return
-	}
-
-	// SECURITY: Validate AK handle is within our expected range
-	if akHandleVal < 0x81000100 || akHandleVal > 0x810001FF {
-		if jsonOutput {
-			protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf(
-				"AK handle 0x%08X is outside the allowed range 0x81000100-0x810001FF", akHandleVal))
-		} else {
-			protocol.HumanMessage("Error: AK handle 0x%08X is outside the allowed range", akHandleVal)
-			os.Exit(1)
-		}
-		return
 	}
 
 	tpmDevice, err := transport.OpenTPM()
@@ -868,7 +894,12 @@ func runSignTPM(jsonOutput bool, nonceB64 string, akHandleStr string, outputCloc
 	}
 	defer tpmDevice.Close()
 
-	result, err := tpm.SignChallengeWithAK(tpmDevice, uint32(akHandleVal), nonceB64)
+	var result *tpm.SignChallengeResult
+	if use_transient_ak {
+		result, err = tpm.SignChallengeWithTransientAK(tpmDevice, nonceB64)
+	} else {
+		result, err = tpm.SignChallengeWithAK(tpmDevice, uint32(akHandleVal), nonceB64)
+	}
 	if err != nil {
 		if jsonOutput {
 			protocol.ErrorResponse("SIGN_FAILED", fmt.Sprintf("TPM signing failed: %v", err))
@@ -881,17 +912,48 @@ func runSignTPM(jsonOutput bool, nonceB64 string, akHandleStr string, outputCloc
 
 	if !outputClock {
 		if jsonOutput {
-			protocol.SuccessResponse(result)
+			if identity_certificate_chain_pem != "" {
+				protocol.SuccessResponse(map[string]interface{}{
+					"signature_b64":                result.SignatureBase64,
+					"ak_handle":                    result.AKHandle,
+					"algorithm":                    result.Algorithm,
+					"identity_certificate_chain_pem": identity_certificate_chain_pem,
+				})
+			} else {
+				protocol.SuccessResponse(result)
+			}
 		} else {
 			protocol.HumanMessage("Challenge signed successfully")
 			protocol.HumanMessage("  Algorithm:  %s", result.Algorithm)
 			protocol.HumanMessage("  AK Handle:  %s", result.AKHandle)
 			protocol.HumanMessage("  Signature:  %s... (%d chars)", result.SignatureBase64[:40], len(result.SignatureBase64))
+			if identity_certificate_chain_pem != "" {
+				protocol.HumanMessage("  Cert chain: included (%d bytes)", len(identity_certificate_chain_pem))
+			}
 		}
 		return
 	}
 
-	quoteResult, quoteErr := tpm.PerformQuoteForClockCapture(tpmDevice, uint32(akHandleVal), nonceB64)
+	// For the quote, we need a valid AK handle. In transient mode, recreate it
+	// (CreatePrimary is deterministic, so the second call produces the same key).
+	var quote_ak_handle_val uint32
+	if use_transient_ak {
+		quote_ak_data, quote_ak_err := tpm.CreateTransientAK(tpmDevice)
+		if quote_ak_err != nil {
+			if jsonOutput {
+				protocol.ErrorResponse("HSM_ACCESS_ERROR", fmt.Sprintf("Could not recreate AK for quote: %v", quote_ak_err))
+			} else {
+				protocol.HumanMessage("Error: Could not recreate AK for quote: %v", quote_ak_err)
+				os.Exit(1)
+			}
+			return
+		}
+		defer tpm.FlushTransientAK(tpmDevice, quote_ak_data)
+		quote_ak_handle_val = uint32(quote_ak_data.TransientHandle)
+	} else {
+		quote_ak_handle_val = uint32(akHandleVal)
+	}
+	quoteResult, quoteErr := tpm.PerformQuoteForClockCapture(tpmDevice, quote_ak_handle_val, nonceB64)
 	if quoteErr != nil {
 		if jsonOutput {
 			protocol.ErrorResponse("QUOTE_FAILED", fmt.Sprintf("TPM Quote for clock capture failed: %v", quoteErr))
@@ -924,7 +986,7 @@ func runSignTPM(jsonOutput bool, nonceB64 string, akHandleStr string, outputCloc
 }
 
 // runSignPIV signs a nonce with the PIV key in slot 9a.
-func runSignPIV(jsonOutput bool, nonceB64 string) {
+func runSignPIV(jsonOutput bool, nonceB64 string, identity_certificate_chain_pem string) {
 	result, err := piv.SignChallengeWithPIVKey(nonceB64)
 	if err != nil {
 		if jsonOutput {
@@ -937,7 +999,16 @@ func runSignPIV(jsonOutput bool, nonceB64 string) {
 	}
 
 	if jsonOutput {
-		protocol.SuccessResponse(result)
+		if identity_certificate_chain_pem != "" {
+			protocol.SuccessResponse(map[string]interface{}{
+				"signature_b64":                result.SignatureBase64,
+				"algorithm":                    result.Algorithm,
+				"serial_number":                result.SerialNumber,
+				"identity_certificate_chain_pem": identity_certificate_chain_pem,
+			})
+		} else {
+			protocol.SuccessResponse(result)
+		}
 	} else {
 		protocol.HumanMessage("Challenge signed successfully (PIV)")
 		protocol.HumanMessage("  Algorithm:    %s", result.Algorithm)
@@ -947,6 +1018,9 @@ func runSignPIV(jsonOutput bool, nonceB64 string) {
 			signature_preview_length = len(result.SignatureBase64)
 		}
 		protocol.HumanMessage("  Signature:    %s... (%d chars)", result.SignatureBase64[:signature_preview_length], len(result.SignatureBase64))
+		if identity_certificate_chain_pem != "" {
+			protocol.HumanMessage("  Cert chain:   included (%d bytes)", len(identity_certificate_chain_pem))
+		}
 	}
 }
 
@@ -1129,11 +1203,10 @@ func runTPMBindQuote(args []string) {
 		}
 	}
 
-	if *extendDataB64 == "" || *qualifyingDataB64 == "" || *akHandleStr == "" {
+	if *extendDataB64 == "" || *qualifyingDataB64 == "" {
 		missingArgs := ""
 		if *extendDataB64 == "" { missingArgs += " --extend-data" }
 		if *qualifyingDataB64 == "" { missingArgs += " --qualifying-data" }
-		if *akHandleStr == "" { missingArgs += " --ak-handle" }
 		if *jsonOutput {
 			protocol.ErrorResponse("MISSING_ARGUMENT", fmt.Sprintf("Required arguments:%s", missingArgs))
 		} else {
@@ -1143,27 +1216,31 @@ func runTPMBindQuote(args []string) {
 		return
 	}
 
-	akHandleClean := strings.TrimPrefix(strings.TrimPrefix(*akHandleStr, "0x"), "0X")
-	akHandleVal, err := strconv.ParseUint(akHandleClean, 16, 32)
-	if err != nil {
-		if *jsonOutput {
-			protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf("Invalid AK handle '%s': %v", *akHandleStr, err))
-		} else {
-			protocol.HumanMessage("Error: invalid AK handle '%s': %v", *akHandleStr, err)
-			os.Exit(1)
+	use_transient_ak_for_bind_quote := *akHandleStr == "" || *akHandleStr == "transient"
+	var akHandleVal uint64
+	if !use_transient_ak_for_bind_quote {
+		akHandleClean := strings.TrimPrefix(strings.TrimPrefix(*akHandleStr, "0x"), "0X")
+		var parse_err error
+		akHandleVal, parse_err = strconv.ParseUint(akHandleClean, 16, 32)
+		if parse_err != nil {
+			if *jsonOutput {
+				protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf("Invalid AK handle '%s': %v", *akHandleStr, parse_err))
+			} else {
+				protocol.HumanMessage("Error: invalid AK handle '%s': %v", *akHandleStr, parse_err)
+				os.Exit(1)
+			}
+			return
 		}
-		return
-	}
-
-	if akHandleVal < 0x81000100 || akHandleVal > 0x810001FF {
-		if *jsonOutput {
-			protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf(
-				"AK handle 0x%08X is outside the allowed range 0x81000100-0x810001FF", akHandleVal))
-		} else {
-			protocol.HumanMessage("Error: AK handle 0x%08X is outside the allowed range", akHandleVal)
-			os.Exit(1)
+		if akHandleVal < 0x81000100 || akHandleVal > 0x810001FF {
+			if *jsonOutput {
+				protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf(
+					"AK handle 0x%08X is outside the allowed range 0x81000100-0x810001FF", akHandleVal))
+			} else {
+				protocol.HumanMessage("Error: AK handle 0x%08X is outside the allowed range", akHandleVal)
+				os.Exit(1)
+			}
+			return
 		}
-		return
 	}
 
 	if *extendPCR < 0 || *extendPCR > 23 {
@@ -1188,7 +1265,24 @@ func runTPMBindQuote(args []string) {
 	}
 	defer tpmDevice.Close()
 
-	result, err := tpm.ExtendPCRAndQuote(tpmDevice, uint32(akHandleVal), *extendPCR, *extendDataB64, *qualifyingDataB64)
+	var bind_quote_ak_handle uint32
+	if use_transient_ak_for_bind_quote {
+		bind_ak, bind_ak_err := tpm.CreateTransientAK(tpmDevice)
+		if bind_ak_err != nil {
+			if *jsonOutput {
+				protocol.ErrorResponse("HSM_ACCESS_ERROR", fmt.Sprintf("Could not recreate AK for bind-quote: %v", bind_ak_err))
+			} else {
+				protocol.HumanMessage("Error: Could not recreate AK for bind-quote: %v", bind_ak_err)
+				os.Exit(1)
+			}
+			return
+		}
+		defer tpm.FlushTransientAK(tpmDevice, bind_ak)
+		bind_quote_ak_handle = uint32(bind_ak.TransientHandle)
+	} else {
+		bind_quote_ak_handle = uint32(akHandleVal)
+	}
+	result, err := tpm.ExtendPCRAndQuote(tpmDevice, bind_quote_ak_handle, *extendPCR, *extendDataB64, *qualifyingDataB64)
 	if err != nil {
 		if *jsonOutput {
 			protocol.ErrorResponse("BIND_QUOTE_FAILED", fmt.Sprintf("TPM bind-quote failed: %v", err))
