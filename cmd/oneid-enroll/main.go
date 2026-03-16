@@ -20,6 +20,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"flag"
 	"fmt"
@@ -108,7 +109,7 @@ func validateOutputFilePath(outputFilePath string) error {
 	return nil
 }
 
-var version = "0.5.0"
+var version = "0.6.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -132,6 +133,8 @@ func main() {
 		runPIVSignArbitraryData(subArgs)
 	case "tpm-bind-quote":
 		runTPMBindQuote(subArgs)
+	case "piv-bind-ceremony":
+		runPIVBindCeremony(subArgs)
 	case "setup-tbs":
 		runSetupTBS(subArgs)
 	case "session":
@@ -1305,6 +1308,177 @@ func runTPMBindQuote(args []string) {
 		protocol.HumanMessage("  Clock safe:     %v", result.ClockSafe)
 		protocol.HumanMessage("  PCR%d value:    %s", *extendPCR, result.PCR16ValueBase64)
 	}
+}
+
+// runPIVBindCeremony orchestrates all 3 phases of co-location binding in
+// a single process invocation. This eliminates TPM2_CreatePrimary overhead
+// from separate process launches, keeping the clock delta within the 365ms
+// threshold required by the server.
+//
+// Phase 1: TPM2_Quote with server nonce (captures C1 clock + S1 signature)
+// Phase 2: PIV sign SHA256(N1 || S1) (produces S2 + attestation cert)
+// Phase 3: TPM2_PCR_Extend(16, SHA256(S2)) then TPM2_Quote (captures C2 clock)
+//
+// Windows: PCR_Extend requires elevation (UAC). The binary is code-signed.
+func runPIVBindCeremony(args []string) {
+	flags := flag.NewFlagSet("piv-bind-ceremony", flag.ExitOnError)
+	jsonOutput := flags.Bool("json", false, "output JSON")
+	nonceB64 := flags.String("nonce", "", "base64-encoded server nonce (N1)")
+	sessionID := flags.String("session-id", "", "binding session ID from server")
+	wantElevation := flags.Bool("elevated", false, "trigger UAC/sudo for PCR_Extend (required on Windows)")
+	outputFile := flags.String("output-file", "", "write output to file (used by elevation)")
+	alreadyElevated := flags.Bool("_already-elevated", false, "internal: marks process as already elevated")
+	flags.Parse(args)
+
+	if *wantElevation && !*alreadyElevated && !elevate.IsRunningElevated() {
+		if err := elevate.RelaunchElevated(); err != nil {
+			if *jsonOutput {
+				protocol.ErrorResponse("ELEVATION_FAILED", fmt.Sprintf("Could not elevate: %v", err))
+			} else {
+				protocol.HumanMessage("Error: could not elevate: %v", err)
+				os.Exit(1)
+			}
+			return
+		}
+	}
+
+	if *outputFile != "" {
+		if err := validateOutputFilePath(*outputFile); err != nil {
+			protocol.ErrorResponse("INVALID_OUTPUT_PATH", fmt.Sprintf("Rejected output file path: %v", err))
+			return
+		}
+		f, err := os.Create(*outputFile)
+		if err == nil {
+			os.Stdout = f
+			defer f.Close()
+		}
+	}
+
+	if *nonceB64 == "" {
+		if *jsonOutput {
+			protocol.ErrorResponse("MISSING_ARGUMENT", "Required argument: --nonce")
+		} else {
+			protocol.HumanMessage("Error: required argument: --nonce")
+			os.Exit(1)
+		}
+		return
+	}
+
+	// ── Open TPM (once) ──
+	tpm_device, err := transport.OpenTPM()
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("NO_HSM_FOUND", fmt.Sprintf("Could not open TPM: %v", err))
+		} else {
+			protocol.HumanMessage("Error: Could not open TPM: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+	defer tpm_device.Close()
+
+	// ── Create transient AK (once) ──
+	ak_data, err := tpm.CreateTransientAK(tpm_device)
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("HSM_ACCESS_ERROR", fmt.Sprintf("Could not create AK: %v", err))
+		} else {
+			protocol.HumanMessage("Error: Could not create AK: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+	defer tpm.FlushTransientAK(tpm_device, ak_data)
+	ceremony_ak_handle := uint32(ak_data.TransientHandle)
+
+	// ── Phase 1: TPM Quote with server nonce (clock capture C1) ──
+	c1_quote, err := tpm.PerformQuoteForClockCapture(tpm_device, ceremony_ak_handle, *nonceB64)
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("PHASE1_QUOTE_FAILED", fmt.Sprintf("Phase 1 TPM Quote failed: %v", err))
+		} else {
+			protocol.HumanMessage("Error: Phase 1 TPM Quote failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// S1 = quote signature from Phase 1
+	s1_signature_b64 := c1_quote.SignatureBase64
+
+	// ── Phase 2: PIV sign SHA256(N1 || S1) ──
+	// SignArbitraryDataWithPIVKey manages its own PCSC connection internally
+	// (PCSC only allows one exclusive lock at a time per reader).
+	// Decode nonce for concatenation
+	nonce_bytes, _ := base64.StdEncoding.DecodeString(*nonceB64)
+	s1_signature_bytes, _ := base64.StdEncoding.DecodeString(s1_signature_b64)
+	phase2_input := append(nonce_bytes, s1_signature_bytes...)
+	phase2_input_b64 := base64.StdEncoding.EncodeToString(phase2_input)
+
+	piv_sign_result, err := piv.SignArbitraryDataWithPIVKey(phase2_input_b64)
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("PHASE2_PIV_SIGN_FAILED", fmt.Sprintf("Phase 2 PIV sign failed: %v", err))
+		} else {
+			protocol.HumanMessage("Error: Phase 2 PIV sign failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	s2_signature_b64 := piv_sign_result.S2SignatureBase64
+	s2_signature_bytes, _ := base64.StdEncoding.DecodeString(s2_signature_b64)
+
+	// ── Phase 3: PCR_Extend(16, SHA256(S2)) then TPM Quote ──
+	// Compute SHA256(S2) for PCR extend
+	s2_hash_for_pcr_extend := compute_sha256_digest(s2_signature_bytes)
+	extend_data_b64 := base64.StdEncoding.EncodeToString(s2_hash_for_pcr_extend)
+
+	// Qualifying data for Phase 3 quote = SHA256(N1 || S1 || S2)
+	phase3_qualifying_input := append(nonce_bytes, s1_signature_bytes...)
+	phase3_qualifying_input = append(phase3_qualifying_input, s2_signature_bytes...)
+	phase3_qualifying_hash := compute_sha256_digest(phase3_qualifying_input)
+	phase3_qualifying_b64 := base64.StdEncoding.EncodeToString(phase3_qualifying_hash)
+
+	c2_quote, err := tpm.ExtendPCRAndQuote(tpm_device, ceremony_ak_handle, 16, extend_data_b64, phase3_qualifying_b64)
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("PHASE3_BIND_QUOTE_FAILED", fmt.Sprintf("Phase 3 TPM bind-quote failed: %v", err))
+		} else {
+			protocol.HumanMessage("Error: Phase 3 TPM bind-quote failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// ── Output complete proof bundle ──
+	proof_bundle := map[string]interface{}{
+		"session_id":              *sessionID,
+		"ak_public_pem":          ak_data.PublicKeyPEM,
+		"s1_signature_b64":       s1_signature_b64,
+		"c1_quote":               c1_quote,
+		"s2_signature_b64":       s2_signature_b64,
+		"piv_attestation_cert_pem": piv_sign_result.PIVAttestationCertPEM,
+		"piv_device_serial":      piv_sign_result.PIVDeviceSerial,
+		"c2_quote":               c2_quote,
+	}
+
+	if *jsonOutput {
+		protocol.SuccessResponse(proof_bundle)
+	} else {
+		protocol.HumanMessage("Co-location binding ceremony completed")
+		protocol.HumanMessage("  C1 clock (ms): %d", c1_quote.ClockMilliseconds)
+		protocol.HumanMessage("  C2 clock (ms): %d", c2_quote.ClockMilliseconds)
+		elapsed_ms := c2_quote.ClockMilliseconds - c1_quote.ClockMilliseconds
+		protocol.HumanMessage("  Elapsed (ms):  %d", elapsed_ms)
+		protocol.HumanMessage("  PIV serial:    %s", piv_sign_result.PIVDeviceSerial)
+		protocol.HumanMessage("  Session:       %s", *sessionID)
+	}
+}
+
+func compute_sha256_digest(data []byte) []byte {
+	hash_result := sha256.Sum256(data)
+	return hash_result[:]
 }
 
 // runVersion prints version info.
