@@ -269,8 +269,8 @@ func handleExtract(tpmDevice transport.TPMCloser, args map[string]interface{}) S
 		}
 	}
 
-	// Get or create AK
-	akData, err := tpm.GetOrCreateAK(tpmDevice)
+	// Create transient AK (deterministic -- same key every time on the same TPM)
+	akData, err := tpm.CreateTransientAK(tpmDevice)
 	if err != nil {
 		return SessionResponse{
 			OK:        false,
@@ -278,6 +278,7 @@ func handleExtract(tpmDevice transport.TPMCloser, args map[string]interface{}) S
 			Error:     fmt.Sprintf("Could not generate AK: %v", err),
 		}
 	}
+	tpm.FlushTransientAK(tpmDevice, akData)
 
 	tpmtPublicB64 := base64.StdEncoding.EncodeToString(akData.TPMTPublicBytes)
 
@@ -321,41 +322,45 @@ func handleActivate(tpmDevice transport.TPMCloser, args map[string]interface{}) 
 		}
 	}
 
-	akHandleStr, ok := args["ak_handle"].(string)
-	if !ok || akHandleStr == "" {
-		return SessionResponse{
-			OK:        false,
-			ErrorCode: "MISSING_ARGUMENT",
-			Error:     "Missing required argument: ak_handle",
+	// ak_handle is optional. If empty or "transient", recreate the AK on-demand.
+	// If a persistent handle is provided, use it for backward compat.
+	akHandleStr, _ := args["ak_handle"].(string)
+	use_transient := akHandleStr == "" || akHandleStr == "transient"
+
+	var result *tpm.ActivateCredentialResult
+	var err error
+
+	if use_transient {
+		result, err = tpm.ActivateCredentialWithTransientAK(
+			tpmDevice,
+			credentialBlobB64,
+			encryptedSecretB64,
+		)
+	} else {
+		akHandleClean := strings.TrimPrefix(strings.TrimPrefix(akHandleStr, "0x"), "0X")
+		akHandleVal, parse_err := strconv.ParseUint(akHandleClean, 16, 32)
+		if parse_err != nil {
+			return SessionResponse{
+				OK:        false,
+				ErrorCode: "INVALID_ARGUMENT",
+				Error:     fmt.Sprintf("Invalid AK handle '%s': %v", akHandleStr, parse_err),
+			}
 		}
+		if akHandleVal < 0x81000100 || akHandleVal > 0x810001FF {
+			return SessionResponse{
+				OK:        false,
+				ErrorCode: "INVALID_ARGUMENT",
+				Error:     fmt.Sprintf("AK handle 0x%08X is outside allowed range 0x81000100-0x810001FF", akHandleVal),
+			}
+		}
+		result, err = tpm.ActivateCredential(
+			tpmDevice,
+			uint32(akHandleVal),
+			credentialBlobB64,
+			encryptedSecretB64,
+		)
 	}
 
-	// Parse AK handle
-	akHandleClean := strings.TrimPrefix(strings.TrimPrefix(akHandleStr, "0x"), "0X")
-	akHandleVal, err := strconv.ParseUint(akHandleClean, 16, 32)
-	if err != nil {
-		return SessionResponse{
-			OK:        false,
-			ErrorCode: "INVALID_ARGUMENT",
-			Error:     fmt.Sprintf("Invalid AK handle '%s': %v", akHandleStr, err),
-		}
-	}
-
-	// Validate handle range
-	if akHandleVal < 0x81000100 || akHandleVal > 0x810001FF {
-		return SessionResponse{
-			OK:        false,
-			ErrorCode: "INVALID_ARGUMENT",
-			Error:     fmt.Sprintf("AK handle 0x%08X is outside allowed range 0x81000100-0x810001FF", akHandleVal),
-		}
-	}
-
-	result, err := tpm.ActivateCredential(
-		tpmDevice,
-		uint32(akHandleVal),
-		credentialBlobB64,
-		encryptedSecretB64,
-	)
 	if err != nil {
 		return SessionResponse{
 			OK:        false,
@@ -382,35 +387,34 @@ func handleSign(tpmDevice transport.TPMCloser, args map[string]interface{}) Sess
 		}
 	}
 
-	akHandleStr, ok := args["ak_handle"].(string)
-	if !ok || akHandleStr == "" {
-		return SessionResponse{
-			OK:        false,
-			ErrorCode: "MISSING_ARGUMENT",
-			Error:     "Missing required argument: ak_handle",
-		}
-	}
+	// ak_handle is optional. If empty or "transient", recreate the AK on-demand.
+	akHandleStr, _ := args["ak_handle"].(string)
+	use_transient := akHandleStr == "" || akHandleStr == "transient"
 
-	// Parse AK handle
-	akHandleClean := strings.TrimPrefix(strings.TrimPrefix(akHandleStr, "0x"), "0X")
-	akHandleVal, err := strconv.ParseUint(akHandleClean, 16, 32)
-	if err != nil {
-		return SessionResponse{
-			OK:        false,
-			ErrorCode: "INVALID_ARGUMENT",
-			Error:     fmt.Sprintf("Invalid AK handle '%s': %v", akHandleStr, err),
-		}
-	}
+	var result *tpm.SignChallengeResult
+	var err error
 
-	if akHandleVal < 0x81000100 || akHandleVal > 0x810001FF {
-		return SessionResponse{
-			OK:        false,
-			ErrorCode: "INVALID_ARGUMENT",
-			Error:     fmt.Sprintf("AK handle 0x%08X is outside allowed range 0x81000100-0x810001FF", akHandleVal),
+	if use_transient {
+		result, err = tpm.SignChallengeWithTransientAK(tpmDevice, nonceB64)
+	} else {
+		akHandleClean := strings.TrimPrefix(strings.TrimPrefix(akHandleStr, "0x"), "0X")
+		akHandleVal, parse_err := strconv.ParseUint(akHandleClean, 16, 32)
+		if parse_err != nil {
+			return SessionResponse{
+				OK:        false,
+				ErrorCode: "INVALID_ARGUMENT",
+				Error:     fmt.Sprintf("Invalid AK handle '%s': %v", akHandleStr, parse_err),
+			}
 		}
+		if akHandleVal < 0x81000100 || akHandleVal > 0x810001FF {
+			return SessionResponse{
+				OK:        false,
+				ErrorCode: "INVALID_ARGUMENT",
+				Error:     fmt.Sprintf("AK handle 0x%08X is outside allowed range 0x81000100-0x810001FF", akHandleVal),
+			}
+		}
+		result, err = tpm.SignChallengeWithAK(tpmDevice, uint32(akHandleVal), nonceB64)
 	}
-
-	result, err := tpm.SignChallengeWithAK(tpmDevice, uint32(akHandleVal), nonceB64)
 	if err != nil {
 		return SessionResponse{
 			OK:        false,

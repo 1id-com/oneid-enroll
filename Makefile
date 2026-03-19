@@ -1,18 +1,29 @@
 # Makefile for oneid-enroll -- 1id.com HSM Identity Enrollment Helper
 #
+# IMPORTANT: go-piv (PIV/YubiKey) requires CGo (it calls into PCSC).
+# CGO_ENABLED=1 is mandatory for every build. Cross-compilation needs
+# the target platform's C toolchain + PCSC headers installed.
+#
+# Recommended build strategy (see 001_readme.md for full details):
+#   Windows amd64  — build natively on RoG (CGO_ENABLED=1, Strawberry gcc)
+#   macOS amd64    — build natively on moonmac
+#   macOS arm64    — cross-compile on moonmac (Apple clang handles both)
+#   Linux amd64    — build in WSL (needs libpcsclite-dev)
+#   Linux arm64    — cross-compile in WSL (needs aarch64-linux-gnu toolchain)
+#
+# Quick single-platform build: make build
+# Build current platform only: make build CGO_ENABLED=1
+#
 # Usage:
-#   make build-all     Cross-compile for all platforms (needs Go >= 1.24)
+#   make build         Build for current platform (CGo enabled)
 #   make sign          SHA-256 hash + GPG detached-sign all binaries in build/
 #   make verify        Verify all GPG signatures in build/
 #   make clean         Remove build artifacts
 #
-# Build machine: Windows with Go 1.24+ (cross-compiles everything)
-# Sign machine:  Any machine with gpg and access to signing/gpg/ keyring
-#
 # The signing key (Ed25519, passwordless) lives in signing/gpg/ so that
 # "git pull" on any machine gives full signing capability.
 
-VERSION     ?= 0.3.1
+VERSION     ?= 0.5.0
 BINARY_NAME  = oneid-enroll
 MODULE       = github.com/1id-com/oneid-enroll
 CMD_DIR      = ./cmd/oneid-enroll
@@ -75,12 +86,15 @@ help:
 	@echo "  oneid-enroll build system"
 	@echo "  ========================="
 	@echo ""
-	@echo "  make build           Build for current platform into build/"
-	@echo "  make build-all       Cross-compile all 5 targets into build/"
+	@echo "  make build           Build for current platform (CGo enabled)"
 	@echo "  make sign            SHA-256 + GPG sign all binaries in build/"
 	@echo "  make verify          Verify all GPG signatures in build/"
 	@echo "  make test            Run Go tests"
 	@echo "  make clean           Remove build/"
+	@echo ""
+	@echo "  NOTE: go-piv requires CGO_ENABLED=1 for all builds."
+	@echo "  Cross-compilation needs per-platform C toolchains."
+	@echo "  See 001_readme.md for per-platform build instructions."
 	@echo ""
 	@echo "  Detected: $(NATIVE_OS)/$(NATIVE_ARCH)"
 	@echo "  Binary:   $(NATIVE_BINARY)"
@@ -90,15 +104,18 @@ help:
 # Build targets
 # ---------------------------------------------------------------------------
 
-# Build for the current platform only
+# Build for the current platform only (CGo enabled for go-piv PCSC)
 build:
 	@mkdir -p $(BUILD_DIR)
-	GOOS=$(NATIVE_OS) GOARCH=$(NATIVE_ARCH) go build -ldflags "$(LDFLAGS)" \
-	  -o $(NATIVE_BINARY) $(CMD_DIR)
+	CGO_ENABLED=1 GOOS=$(NATIVE_OS) GOARCH=$(NATIVE_ARCH) go build \
+	  -ldflags "$(LDFLAGS)" -o $(NATIVE_BINARY) $(CMD_DIR)
 	@echo "Built: $(NATIVE_BINARY)"
 	@chmod +x $(NATIVE_BINARY) 2>/dev/null || true
 
-# Cross-compile everything (run on the build machine with Go >= 1.24)
+# Build all 5 platforms. Because go-piv requires CGo and platform-specific
+# PCSC libraries, this target only works if ALL cross-compilation toolchains
+# are installed. In practice, build each platform on its native machine
+# (or with the correct cross-compiler). This target is here for reference.
 build-all: build-windows-amd64 build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64
 	@echo ""
 	@echo "All binaries:"
@@ -107,27 +124,27 @@ build-all: build-windows-amd64 build-linux-amd64 build-linux-arm64 build-darwin-
 
 build-windows-amd64:
 	@mkdir -p $(BUILD_DIR)
-	GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" \
+	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" \
 	  -o $(BUILD_DIR)/$(BINARY_NAME)-windows-amd64.exe $(CMD_DIR)
 
 build-linux-amd64:
 	@mkdir -p $(BUILD_DIR)
-	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" \
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" \
 	  -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 $(CMD_DIR)
 
 build-linux-arm64:
 	@mkdir -p $(BUILD_DIR)
-	GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" \
+	CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" \
 	  -o $(BUILD_DIR)/$(BINARY_NAME)-linux-arm64 $(CMD_DIR)
 
 build-darwin-amd64:
 	@mkdir -p $(BUILD_DIR)
-	GOOS=darwin GOARCH=amd64 go build -ldflags "$(LDFLAGS)" \
+	CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -ldflags "$(LDFLAGS)" \
 	  -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64 $(CMD_DIR)
 
 build-darwin-arm64:
 	@mkdir -p $(BUILD_DIR)
-	GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" \
+	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" \
 	  -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 $(CMD_DIR)
 
 # ---------------------------------------------------------------------------

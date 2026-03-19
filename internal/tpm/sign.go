@@ -10,6 +10,9 @@
 // for ongoing authentication -- agents should not need UAC/sudo every time
 // they sign in.
 //
+// TRANSIENT-ONLY: The AK is recreated on demand via CreatePrimary. Same
+// template + same hierarchy seed = same key every time. No persistent handles.
+//
 // ┌─────────────────────────────────────────────────────────────────────┐
 // │ SECURITY NOTE                                                       │
 // │                                                                     │
@@ -26,111 +29,116 @@
 package tpm
 
 import (
-	"encoding/base64"
-	"fmt"
+  "encoding/base64"
+  "fmt"
 
-	"github.com/google/go-tpm/tpm2"
-	"github.com/google/go-tpm/tpm2/transport"
+  "github.com/google/go-tpm/tpm2"
+  "github.com/google/go-tpm/tpm2/transport"
 )
 
 // SignChallengeResult holds the output of signing a challenge nonce.
 type SignChallengeResult struct {
-	SignatureBase64 string `json:"signature_b64"`  // Base64-encoded raw RSA signature
-	AKHandle        string `json:"ak_handle"`       // Handle used for signing
-	Algorithm       string `json:"algorithm"`       // "RSASSA-SHA256"
+  SignatureBase64 string `json:"signature_b64"`
+  AKHandle        string `json:"ak_handle"`
+  Algorithm       string `json:"algorithm"`
 }
 
-// SignChallengeWithAK signs a nonce/challenge using the persistent AK.
+// SignChallengeWithTransientAK signs a nonce by recreating the transient AK.
 //
-// This is the core of hardware-backed authentication: the server sends a
-// random nonce, we sign it with the AK (whose private key is locked inside
-// the TPM), and the server verifies with the AK public key it stored at
-// enrollment.
+// This is the preferred method: the AK is deterministic (same key every time),
+// so no persistent handle is needed. CreatePrimary + Sign + Flush.
 //
-// DOES NOT REQUIRE ELEVATION on most platforms. The AK has UserWithAuth=true
-// and empty password, so TPM2_Sign is accessible to any process that can
-// open the TPM device.
-//
-// Parameters:
-//   - tpmTransport: open TPM connection
-//   - akHandle: persistent handle of the AK (e.g., 0x81000100)
-//   - nonceBase64: base64-encoded nonce from the server
-//
-// Returns the RSA signature as base64.
-func SignChallengeWithAK(
-	tpmTransport transport.TPMCloser,
-	akHandle uint32,
-	nonceBase64 string,
+// DOES NOT REQUIRE ELEVATION (after one-time TBS setup on Windows).
+func SignChallengeWithTransientAK(
+  tpmTransport transport.TPMCloser,
+  nonceBase64 string,
 ) (*SignChallengeResult, error) {
-	// Decode the nonce
-	nonceBytes, err := base64.StdEncoding.DecodeString(nonceBase64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid base64 nonce: %w", err)
-	}
+  akData, err := CreateTransientAK(tpmTransport)
+  if err != nil {
+    return nil, fmt.Errorf("could not recreate transient AK for signing: %w", err)
+  }
+  defer FlushTransientAK(tpmTransport, akData)
 
-	if len(nonceBytes) == 0 || len(nonceBytes) > 1024 {
-		return nil, fmt.Errorf("nonce must be 1-1024 bytes, got %d", len(nonceBytes))
-	}
+  return signWithAKHandle(tpmTransport, akData.TransientHandle, nonceBase64)
+}
 
-	// The AK is a RESTRICTED signing key. The TPM will refuse to sign data
-	// unless we prove it wasn't produced by the TPM itself. We use TPM2_Hash
-	// to hash the nonce on the TPM, which returns a "ticket" proving the data
-	// came from outside.
-	hashCmd := tpm2.Hash{
-		Data:      tpm2.TPM2BMaxBuffer{Buffer: nonceBytes},
-		HashAlg:   tpm2.TPMAlgSHA256,
-		Hierarchy: tpm2.TPMRHEndorsement,
-	}
+// SignChallengeWithAK signs a nonce using a persistent AK handle.
+// DEPRECATED: Use SignChallengeWithTransientAK instead. This function
+// exists for backward compatibility with machines that have persistent AKs
+// from older binary versions.
+func SignChallengeWithAK(
+  tpmTransport transport.TPMCloser,
+  akHandle uint32,
+  nonceBase64 string,
+) (*SignChallengeResult, error) {
+  return signWithAKHandle(tpmTransport, tpm2.TPMHandle(akHandle), nonceBase64)
+}
 
-	hashResp, err := hashCmd.Execute(tpmTransport)
-	if err != nil {
-		return nil, fmt.Errorf("TPM2_Hash failed: %w", err)
-	}
+// signWithAKHandle is the shared implementation for signing with any AK handle
+// (transient or persistent).
+func signWithAKHandle(
+  tpmTransport transport.TPMCloser,
+  akHandle tpm2.TPMHandle,
+  nonceBase64 string,
+) (*SignChallengeResult, error) {
+  nonceBytes, err := base64.StdEncoding.DecodeString(nonceBase64)
+  if err != nil {
+    return nil, fmt.Errorf("invalid base64 nonce: %w", err)
+  }
 
-	// Read the AK's public area to get its TPM Name.
-	// go-tpm requires the Name for authorization checks.
-	readPubResp, err := tpm2.ReadPublic{
-		ObjectHandle: tpm2.TPMHandle(akHandle),
-	}.Execute(tpmTransport)
-	if err != nil {
-		return nil, fmt.Errorf("could not read AK public area (handle 0x%08X): %w", akHandle, err)
-	}
+  if len(nonceBytes) == 0 || len(nonceBytes) > 1024 {
+    return nil, fmt.Errorf("nonce must be 1-1024 bytes, got %d", len(nonceBytes))
+  }
 
-	// Now sign the hash using the AK.
-	// The ticket from TPM2_Hash proves the data originated externally,
-	// which satisfies the restricted key requirement.
-	signCmd := tpm2.Sign{
-		KeyHandle: tpm2.NamedHandle{
-			Handle: tpm2.TPMHandle(akHandle),
-			Name:   readPubResp.Name,
-		},
-		Digest: hashResp.OutHash,
-		InScheme: tpm2.TPMTSigScheme{
-			Scheme: tpm2.TPMAlgRSASSA,
-			Details: tpm2.NewTPMUSigScheme(
-				tpm2.TPMAlgRSASSA,
-				&tpm2.TPMSSchemeHash{HashAlg: tpm2.TPMAlgSHA256},
-			),
-		},
-		Validation: hashResp.Validation,
-	}
+  hashCmd := tpm2.Hash{
+    Data:      tpm2.TPM2BMaxBuffer{Buffer: nonceBytes},
+    HashAlg:   tpm2.TPMAlgSHA256,
+    Hierarchy: tpm2.TPMRHEndorsement,
+  }
 
-	signResp, err := signCmd.Execute(tpmTransport)
-	if err != nil {
-		return nil, fmt.Errorf("TPM2_Sign failed: %w", err)
-	}
+  hashResp, err := hashCmd.Execute(tpmTransport)
+  if err != nil {
+    return nil, fmt.Errorf("TPM2_Hash failed: %w", err)
+  }
 
-	// Extract the raw RSA signature bytes
-	rsaSig, err := signResp.Signature.Signature.RSASSA()
-	if err != nil {
-		return nil, fmt.Errorf("could not extract RSASSA signature: %w", err)
-	}
+  readPubResp, err := tpm2.ReadPublic{
+    ObjectHandle: akHandle,
+  }.Execute(tpmTransport)
+  if err != nil {
+    return nil, fmt.Errorf("could not read AK public area (handle 0x%08X): %w", uint32(akHandle), err)
+  }
 
-	signatureB64 := base64.StdEncoding.EncodeToString(rsaSig.Sig.Buffer)
+  signCmd := tpm2.Sign{
+    KeyHandle: tpm2.NamedHandle{
+      Handle: akHandle,
+      Name:   readPubResp.Name,
+    },
+    Digest: hashResp.OutHash,
+    InScheme: tpm2.TPMTSigScheme{
+      Scheme: tpm2.TPMAlgRSASSA,
+      Details: tpm2.NewTPMUSigScheme(
+        tpm2.TPMAlgRSASSA,
+        &tpm2.TPMSSchemeHash{HashAlg: tpm2.TPMAlgSHA256},
+      ),
+    },
+    Validation: hashResp.Validation,
+  }
 
-	return &SignChallengeResult{
-		SignatureBase64: signatureB64,
-		AKHandle:        fmt.Sprintf("0x%08X", akHandle),
-		Algorithm:       "RSASSA-SHA256",
-	}, nil
+  signResp, err := signCmd.Execute(tpmTransport)
+  if err != nil {
+    return nil, fmt.Errorf("TPM2_Sign failed: %w", err)
+  }
+
+  rsaSig, err := signResp.Signature.Signature.RSASSA()
+  if err != nil {
+    return nil, fmt.Errorf("could not extract RSASSA signature: %w", err)
+  }
+
+  signatureB64 := base64.StdEncoding.EncodeToString(rsaSig.Sig.Buffer)
+
+  return &SignChallengeResult{
+    SignatureBase64: signatureB64,
+    AKHandle:        fmt.Sprintf("0x%08X", uint32(akHandle)),
+    Algorithm:       "RSASSA-SHA256",
+  }, nil
 }
