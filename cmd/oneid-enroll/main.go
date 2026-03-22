@@ -34,6 +34,7 @@ import (
 	"runtime"
 
 	"github.com/1id-com/oneid-enroll/internal/elevate"
+	"github.com/1id-com/oneid-enroll/internal/enclave"
 	"github.com/1id-com/oneid-enroll/internal/piv"
 	"github.com/1id-com/oneid-enroll/internal/protocol"
 	"github.com/1id-com/oneid-enroll/internal/session"
@@ -141,6 +142,8 @@ func main() {
 		runSession(subArgs)
 	case "version":
 		runVersion(subArgs)
+	case "test-enclave":
+		runTestEnclave(subArgs)
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -157,8 +160,9 @@ Usage:
   oneid-enroll detect    [--json]                          Detect available HSMs (TPM + PIV)
   oneid-enroll setup-tbs [--json] [--elevated]             One-time: grant non-admin TBS access (Windows)
   oneid-enroll extract   [--json] [--elevated]             Extract attestation data
-                         [--type tpm|yubikey]                tpm: EK cert + AK
+                         [--type tpm|yubikey|enclave]        tpm: EK cert + AK
                                                              yubikey: PIV attestation (no elevation)
+                                                             enclave: Secure Enclave P-256 key (macOS)
   oneid-enroll activate  [--json] [--elevated]             Decrypt credential challenge (TPM only)
                          --credential-blob <b64>
                          --encrypted-secret <b64>
@@ -182,7 +186,7 @@ Usage:
 Flags:
   --json       Output JSON to stdout (for SDK consumption)
   --elevated   Trigger UAC/sudo if not already running as admin
-  --type       HSM type: tpm (default) or yubikey
+  --type       HSM type: tpm (default), yubikey, or enclave
   --pipe       Named pipe for session I/O (Windows; Linux/macOS uses stdin/stdout)`)
 }
 
@@ -309,10 +313,10 @@ func runDetect(args []string) {
 	// Detect TPMs
 	detectedTPMs := tpm.DetectTPMs()
 
-	// Detect PIV devices (stub -- returns empty in Phase 1)
 	detectedPIV := piv.DetectPIVDevices()
 
-	// Build unified HSM list
+	detectedEnclaves := enclave.DetectSecureEnclave()
+
 	type hsmEntry struct {
 		Type             string `json:"type"`
 		Manufacturer     string `json:"manufacturer,omitempty"`
@@ -320,6 +324,7 @@ func runDetect(args []string) {
 		FirmwareVersion  string `json:"firmware_version,omitempty"`
 		Status           string `json:"status"`
 		Interface        string `json:"interface,omitempty"`
+		Platform         string `json:"platform,omitempty"`
 		ErrorDetail      string `json:"error_detail,omitempty"`
 	}
 
@@ -344,6 +349,17 @@ func runDetect(args []string) {
 			FirmwareVersion:  p.FirmwareVersion,
 			Status:           p.Status,
 		})
+	}
+
+	for _, e := range detectedEnclaves {
+		if e.HasSecureEnclave {
+			hsms = append(hsms, hsmEntry{
+				Type:         e.Type,
+				Manufacturer: "Apple",
+				Status:       e.Status,
+				Platform:     e.Platform,
+			})
+		}
 	}
 
 	if *jsonOutput {
@@ -445,6 +461,8 @@ func runExtract(args []string) {
 		runExtractTPM(*jsonOutput)
 	case "yubikey", "piv":
 		runExtractPIV(*jsonOutput)
+	case "enclave", "secure_enclave":
+		runExtractEnclave(*jsonOutput)
 	default:
 		if *jsonOutput {
 			protocol.ErrorResponse("UNSUPPORTED_HSM", fmt.Sprintf("HSM type '%s' is not yet supported for extraction", *hsmType))
@@ -603,6 +621,84 @@ func runExtractPIV(jsonOutput bool) {
 		protocol.HumanMessage("  PIN policy:   %s", piv_extract_result.PINPolicy)
 		protocol.HumanMessage("  Touch policy: %s", piv_extract_result.TouchPolicy)
 		protocol.HumanMessage("  Key status:   %s", generated_or_reused_label)
+	}
+}
+
+// runExtractEnclave generates (or reuses) a P-256 key in the Apple Secure Enclave.
+//
+// NO ELEVATION REQUIRED: Secure Enclave keys are accessed through the Keychain,
+// which is available to the current user without admin privileges.
+//
+// The key is tagged with "com.1id.enclave.default" in the Keychain.
+// Future: the tag should include the agent_id for multi-identity support.
+func runExtractEnclave(jsonOutput bool) {
+	const enclave_keychain_application_tag = "com.1id.enclave.default"
+
+	result, err := enclave.GenerateOrRetrieveEnclaveKey(enclave_keychain_application_tag)
+	if err != nil {
+		if jsonOutput {
+			protocol.ErrorResponse("HSM_ACCESS_ERROR", fmt.Sprintf("Secure Enclave extraction failed: %v", err))
+		} else {
+			protocol.HumanMessage("Error: Secure Enclave extraction failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if jsonOutput {
+		protocol.SuccessResponse(result)
+	} else {
+		generated_or_reused_label := "Existing key reused"
+		if result.KeyWasNewlyGenerated {
+			generated_or_reused_label = "New key generated in Secure Enclave"
+		}
+		protocol.HumanMessage("Secure Enclave key extracted successfully")
+		protocol.HumanMessage("  Algorithm:  %s", result.Algorithm)
+		protocol.HumanMessage("  Key tag:    %s", result.KeyTag)
+		protocol.HumanMessage("  Key status: %s", generated_or_reused_label)
+	}
+}
+
+// runSignEnclave signs a nonce with the Secure Enclave key.
+//
+// NO ELEVATION REQUIRED.
+func runSignEnclave(jsonOutput bool, nonceB64 string, identity_certificate_chain_pem string) {
+	const enclave_keychain_application_tag = "com.1id.enclave.default"
+
+	result, err := enclave.SignChallengeWithEnclaveKey(nonceB64, enclave_keychain_application_tag)
+	if err != nil {
+		if jsonOutput {
+			protocol.ErrorResponse("SIGN_FAILED", fmt.Sprintf("Secure Enclave signing failed: %v", err))
+		} else {
+			protocol.HumanMessage("Error: Secure Enclave signing failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if jsonOutput {
+		if identity_certificate_chain_pem != "" {
+			protocol.SuccessResponse(map[string]interface{}{
+				"signature_b64":                  result.SignatureBase64,
+				"algorithm":                      result.Algorithm,
+				"key_tag":                         result.KeyTag,
+				"identity_certificate_chain_pem": identity_certificate_chain_pem,
+			})
+		} else {
+			protocol.SuccessResponse(result)
+		}
+	} else {
+		protocol.HumanMessage("Challenge signed successfully (Secure Enclave)")
+		protocol.HumanMessage("  Algorithm:  %s", result.Algorithm)
+		protocol.HumanMessage("  Key tag:    %s", result.KeyTag)
+		signature_preview_length := 40
+		if len(result.SignatureBase64) < signature_preview_length {
+			signature_preview_length = len(result.SignatureBase64)
+		}
+		protocol.HumanMessage("  Signature:  %s... (%d chars)", result.SignatureBase64[:signature_preview_length], len(result.SignatureBase64))
+		if identity_certificate_chain_pem != "" {
+			protocol.HumanMessage("  Cert chain: included (%d bytes)", len(identity_certificate_chain_pem))
+		}
 	}
 }
 
@@ -844,6 +940,17 @@ func runSign(args []string) {
 		runSignPIV(*jsonOutput, *nonceB64, identity_certificate_chain_pem)
 	case "tpm":
 		runSignTPM(*jsonOutput, *nonceB64, *akHandleStr, *outputClock, identity_certificate_chain_pem)
+	case "enclave", "secure_enclave":
+		if *outputClock {
+			if *jsonOutput {
+				protocol.ErrorResponse("UNSUPPORTED_OPTION", "--output-clock is only supported for TPM signing")
+			} else {
+				protocol.HumanMessage("Error: --output-clock is only supported for TPM signing")
+				os.Exit(1)
+			}
+			return
+		}
+		runSignEnclave(*jsonOutput, *nonceB64, identity_certificate_chain_pem)
 	default:
 		if *jsonOutput {
 			protocol.ErrorResponse("UNSUPPORTED_HSM", fmt.Sprintf("HSM type '%s' is not supported for signing", *hsmType))
@@ -1479,6 +1586,37 @@ func runPIVBindCeremony(args []string) {
 func compute_sha256_digest(data []byte) []byte {
 	hash_result := sha256.Sum256(data)
 	return hash_result[:]
+}
+
+// runTestEnclave creates a transient (non-persistent) Secure Enclave key,
+// signs test data, and reports the results. No Keychain entitlements needed
+// because the key is not stored persistently. This validates that the Secure
+// Enclave hardware is accessible and functional.
+func runTestEnclave(args []string) {
+	flags := flag.NewFlagSet("test-enclave", flag.ExitOnError)
+	jsonOutput := flags.Bool("json", false, "output JSON")
+	flags.Parse(args)
+
+	test_data_for_signing := []byte("1id.com Secure Enclave hardware verification test")
+	result, err := enclave.TestTransientEnclaveKeygenAndSign(test_data_for_signing)
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("ENCLAVE_TEST_FAILED", fmt.Sprintf("Secure Enclave test failed: %v", err))
+		} else {
+			protocol.HumanMessage("Error: Secure Enclave test failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *jsonOutput {
+		protocol.SuccessResponse(result)
+	} else {
+		protocol.HumanMessage("Secure Enclave transient key test PASSED")
+		protocol.HumanMessage("  Algorithm:  %s", result.Algorithm)
+		protocol.HumanMessage("  Public key: %s...", result.PublicKeyPEM[:60])
+		protocol.HumanMessage("  Signature:  %s...", result.SignatureBase64[:40])
+	}
 }
 
 // runVersion prints version info.
