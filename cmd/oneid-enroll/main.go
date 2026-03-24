@@ -110,7 +110,7 @@ func validateOutputFilePath(outputFilePath string) error {
 	return nil
 }
 
-var version = "0.7.0"
+var version = "1.0.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -142,6 +142,10 @@ func main() {
 		runSession(subArgs)
 	case "version":
 		runVersion(subArgs)
+	case "seal":
+		runSeal(subArgs)
+	case "unseal":
+		runUnseal(subArgs)
 	case "test-enclave":
 		runTestEnclave(subArgs)
 	case "help", "--help", "-h":
@@ -179,6 +183,11 @@ Usage:
                          --extend-data <b64>                  is blocked by TBS for standard users)
                          --qualifying-data <b64>
                          --ak-handle <hex>
+  oneid-enroll seal      [--json]                          Seal data under TPM Storage Root Key
+                         --data <b64>                        base64 plaintext (max 128 bytes)
+  oneid-enroll unseal    [--json]                          Unseal data from TPM-sealed blob
+                         --sealed-private <b64>              sealed private blob from seal
+                         --sealed-public <b64>               sealed public blob from seal
   oneid-enroll session   [--elevated] [--pipe <name>]      Interactive session (one UAC, TPM only)
   oneid-enroll version   [--json]                          Print version
   oneid-enroll help                                        Print this help
@@ -1616,6 +1625,103 @@ func runTestEnclave(args []string) {
 		protocol.HumanMessage("  Algorithm:  %s", result.Algorithm)
 		protocol.HumanMessage("  Public key: %s...", result.PublicKeyPEM[:60])
 		protocol.HumanMessage("  Signature:  %s...", result.SignatureBase64[:40])
+	}
+}
+
+// runSeal encrypts data under the TPM Storage Root Key (SRK).
+// The sealed private+public blobs can only be unsealed on this same TPM.
+func runSeal(args []string) {
+	flags := flag.NewFlagSet("seal", flag.ExitOnError)
+	jsonOutput := flags.Bool("json", false, "output JSON")
+	dataB64 := flags.String("data", "", "base64-encoded plaintext to seal (max 128 bytes)")
+	flags.Parse(args)
+
+	if *dataB64 == "" {
+		if *jsonOutput {
+			protocol.ErrorResponse("MISSING_ARGUMENT", "Required: --data (base64 plaintext)")
+		} else {
+			fmt.Fprintln(os.Stderr, "Error: --data is required (base64 plaintext to seal)")
+		}
+		os.Exit(1)
+	}
+
+	tpmDevice, err := transport.OpenTPM()
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("TPM_OPEN_FAILED", err.Error())
+		} else {
+			fmt.Fprintf(os.Stderr, "Error opening TPM: %v\n", err)
+		}
+		os.Exit(1)
+	}
+	defer tpmDevice.Close()
+
+	result, err := tpm.SealData(tpmDevice, *dataB64)
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("SEAL_FAILED", err.Error())
+		} else {
+			fmt.Fprintf(os.Stderr, "Seal failed: %v\n", err)
+		}
+		os.Exit(1)
+	}
+
+	if *jsonOutput {
+		protocol.SuccessResponse(result)
+	} else {
+		protocol.HumanMessage("Data sealed successfully under TPM SRK")
+		protocol.HumanMessage("  sealed_private: %s", result.SealedPrivateB64[:40]+"...")
+		protocol.HumanMessage("  sealed_public:  %s", result.SealedPublicB64[:40]+"...")
+		protocol.HumanMessage("Store BOTH blobs. Unseal requires this same TPM.")
+	}
+}
+
+// runUnseal recovers plaintext from a TPM-sealed blob.
+func runUnseal(args []string) {
+	flags := flag.NewFlagSet("unseal", flag.ExitOnError)
+	jsonOutput := flags.Bool("json", false, "output JSON")
+	sealedPrivateB64 := flags.String("sealed-private", "", "sealed private blob (base64)")
+	sealedPublicB64 := flags.String("sealed-public", "", "sealed public blob (base64)")
+	flags.Parse(args)
+
+	if *sealedPrivateB64 == "" || *sealedPublicB64 == "" {
+		missingArgs := ""
+		if *sealedPrivateB64 == "" { missingArgs += " --sealed-private" }
+		if *sealedPublicB64 == "" { missingArgs += " --sealed-public" }
+		if *jsonOutput {
+			protocol.ErrorResponse("MISSING_ARGUMENT", fmt.Sprintf("Required:%s", missingArgs))
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: required arguments:%s\n", missingArgs)
+		}
+		os.Exit(1)
+	}
+
+	tpmDevice, err := transport.OpenTPM()
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("TPM_OPEN_FAILED", err.Error())
+		} else {
+			fmt.Fprintf(os.Stderr, "Error opening TPM: %v\n", err)
+		}
+		os.Exit(1)
+	}
+	defer tpmDevice.Close()
+
+	result, err := tpm.UnsealData(tpmDevice, *sealedPrivateB64, *sealedPublicB64)
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("UNSEAL_FAILED", err.Error())
+		} else {
+			fmt.Fprintf(os.Stderr, "Unseal failed: %v\n", err)
+		}
+		os.Exit(1)
+	}
+
+	if *jsonOutput {
+		protocol.SuccessResponse(result)
+	} else {
+		protocol.HumanMessage("Data unsealed successfully")
+		protocol.HumanMessage("  plaintext (base64): %s", result.PlaintextB64)
 	}
 }
 
