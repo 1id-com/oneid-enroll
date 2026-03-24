@@ -33,3 +33,23 @@ type TransientEnclaveTestResult struct {
   TestDataBase64  string `json:"test_data_b64"`
 }
 
+// EnclaveKeyWrapResult holds the output of a Secure Enclave ECDH + AES Key
+// Wrap operation. The ephemeral public key and wrapped ciphertext are both
+// needed to unwrap later (the Enclave private key is the other half).
+type EnclaveKeyWrapResult struct {
+  EphemeralPublicKeyBase64     string `json:"ephemeral_public_key_b64"`
+  WrappedKeyBase64             string `json:"wrapped_key_b64"`
+  EnclavePublicKeyBase64       string `json:"enclave_public_key_b64"`
+  EnclavePublicKeyPEM          string `json:"enclave_public_key_pem"`
+  Algorithm                    string `json:"algorithm"`
+  PlaintextKeySizeBytes        int    `json:"plaintext_key_size_bytes"`
+}
+
+// EnclaveKeyUnwrapResult holds the recovered plaintext key after a Secure
+// Enclave ECDH + AES Key Unwrap operation.
+type EnclaveKeyUnwrapResult struct {
+  PlaintextKeyBase64     string `json:"plaintext_key_b64"`
+  PlaintextKeySizeBytes  int    `json:"plaintext_key_size_bytes"`
+  Algorithm              string `json:"algorithm"`
+}
+

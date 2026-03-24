@@ -39,6 +39,7 @@ type swift_helper_json_response struct {
   Error               string `json:"error"`
   ErrorCode           string `json:"error_code"`
   PublicKeyPEM        string `json:"public_key_pem"`
+  PublicKeyX963B64    string `json:"public_key_x963_b64"`
   KeyTag              string `json:"key_tag"`
   Algorithm           string `json:"algorithm"`
   KeyWasNewlyGenerated bool  `json:"key_was_newly_generated"`
@@ -46,6 +47,7 @@ type swift_helper_json_response struct {
   TestDataBase64      string `json:"test_data_b64"`
   HasSecureEnclave    bool   `json:"has_secure_enclave"`
   Platform            string `json:"platform"`
+  SharedSecretB64     string `json:"shared_secret_b64"`
 }
 
 func run_se_helper(args ...string) (*swift_helper_json_response, error) {

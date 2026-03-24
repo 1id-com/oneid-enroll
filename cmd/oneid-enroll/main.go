@@ -146,6 +146,14 @@ func main() {
 		runSeal(subArgs)
 	case "unseal":
 		runUnseal(subArgs)
+	case "piv-wrap":
+		runPIVWrap(subArgs)
+	case "piv-unwrap":
+		runPIVUnwrap(subArgs)
+	case "enclave-wrap":
+		runEnclaveWrap(subArgs)
+	case "enclave-unwrap":
+		runEnclaveUnwrap(subArgs)
 	case "test-enclave":
 		runTestEnclave(subArgs)
 	case "help", "--help", "-h":
@@ -188,6 +196,16 @@ Usage:
   oneid-enroll unseal    [--json]                          Unseal data from TPM-sealed blob
                          --sealed-private <b64>              sealed private blob from seal
                          --sealed-public <b64>               sealed public blob from seal
+  oneid-enroll piv-wrap  [--json]                          Wrap key with PIV ECDH + AES-KW (slot 9d)
+                         --data <b64>                        base64 key to wrap (16-128 bytes, mult of 8)
+  oneid-enroll piv-unwrap [--json]                         Unwrap key with PIV ECDH + AES-KW (slot 9d)
+                         --ephemeral-pub <b64>               ephemeral public key from piv-wrap
+                         --wrapped-key <b64>                 wrapped ciphertext from piv-wrap
+  oneid-enroll enclave-wrap  [--json]                      Wrap key with Secure Enclave ECDH + AES-KW
+                         --data <b64>                        base64 key to wrap (16-128 bytes, mult of 8)
+  oneid-enroll enclave-unwrap [--json]                     Unwrap key with Secure Enclave ECDH + AES-KW
+                         --ephemeral-pub <b64>               ephemeral public key from enclave-wrap
+                         --wrapped-key <b64>                 wrapped ciphertext from enclave-wrap
   oneid-enroll session   [--elevated] [--pipe <name>]      Interactive session (one UAC, TPM only)
   oneid-enroll version   [--json]                          Print version
   oneid-enroll help                                        Print this help
@@ -1723,6 +1741,156 @@ func runUnseal(args []string) {
 		protocol.HumanMessage("Data unsealed successfully")
 		protocol.HumanMessage("  plaintext (base64): %s", result.PlaintextB64)
 	}
+}
+
+// runPIVWrap encrypts a key using ECDH-P256 + AES-256 Key Wrap via the
+// PIV key in slot 9d (Key Management). The ephemeral private key is
+// generated in software and discarded after use; only the PIV public
+// key is needed for wrapping.
+func runPIVWrap(args []string) {
+	flags := flag.NewFlagSet("piv-wrap", flag.ExitOnError)
+	jsonOutput := flags.Bool("json", false, "output JSON")
+	dataB64 := flags.String("data", "", "base64-encoded key to wrap (16-128 bytes, multiple of 8)")
+	flags.Parse(args)
+
+	if *dataB64 == "" {
+		if *jsonOutput {
+			protocol.ErrorResponse("MISSING_ARGUMENT", "Required: --data (base64 key material to wrap)")
+		} else {
+			protocol.HumanMessage("Error: --data is required (base64 key material to wrap)")
+		}
+		os.Exit(1)
+	}
+
+	result, err := piv.WrapKeyWithPIV(*dataB64)
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("PIV_WRAP_FAILED", err.Error())
+		} else {
+			protocol.HumanMessage("Error: PIV wrap failed: %v", err)
+		}
+		os.Exit(1)
+	}
+
+	if *jsonOutput {
+		protocol.SuccessResponse(result)
+	} else {
+		protocol.HumanMessage("Key wrapped successfully with PIV slot 9d")
+		protocol.HumanMessage("  Algorithm:      %s", result.Algorithm)
+		protocol.HumanMessage("  PIV serial:     %s", result.PIVDeviceSerial)
+		protocol.HumanMessage("  Slot:           %s", result.PIVSlot)
+		ephemeral_preview_length := 40
+		if len(result.EphemeralPublicKeyB64) < ephemeral_preview_length {
+			ephemeral_preview_length = len(result.EphemeralPublicKeyB64)
+		}
+		protocol.HumanMessage("  Ephemeral pub:  %s... (%d chars)", result.EphemeralPublicKeyB64[:ephemeral_preview_length], len(result.EphemeralPublicKeyB64))
+		wrapped_preview_length := 40
+		if len(result.WrappedKeyB64) < wrapped_preview_length {
+			wrapped_preview_length = len(result.WrappedKeyB64)
+		}
+		protocol.HumanMessage("  Wrapped key:    %s... (%d chars)", result.WrappedKeyB64[:wrapped_preview_length], len(result.WrappedKeyB64))
+		protocol.HumanMessage("Store both ephemeral-pub and wrapped-key. Unwrap requires this same YubiKey.")
+	}
+}
+
+// runPIVUnwrap decrypts a wrapped key using ECDH on the YubiKey hardware
+// (slot 9d) + AES-256 Key Unwrap. The private key never leaves the device.
+func runPIVUnwrap(args []string) {
+	flags := flag.NewFlagSet("piv-unwrap", flag.ExitOnError)
+	jsonOutput := flags.Bool("json", false, "output JSON")
+	ephemeralPubB64 := flags.String("ephemeral-pub", "", "ephemeral public key from piv-wrap (base64)")
+	wrappedKeyB64 := flags.String("wrapped-key", "", "wrapped ciphertext from piv-wrap (base64)")
+	flags.Parse(args)
+
+	if *ephemeralPubB64 == "" || *wrappedKeyB64 == "" {
+		missingArgs := ""
+		if *ephemeralPubB64 == "" { missingArgs += " --ephemeral-pub" }
+		if *wrappedKeyB64 == "" { missingArgs += " --wrapped-key" }
+		if *jsonOutput {
+			protocol.ErrorResponse("MISSING_ARGUMENT", fmt.Sprintf("Required:%s", missingArgs))
+		} else {
+			protocol.HumanMessage("Error: required arguments:%s", missingArgs)
+		}
+		os.Exit(1)
+	}
+
+	result, err := piv.UnwrapKeyWithPIV(*ephemeralPubB64, *wrappedKeyB64)
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("PIV_UNWRAP_FAILED", err.Error())
+		} else {
+			protocol.HumanMessage("Error: PIV unwrap failed: %v", err)
+		}
+		os.Exit(1)
+	}
+
+	if *jsonOutput {
+		protocol.SuccessResponse(result)
+	} else {
+		protocol.HumanMessage("Key unwrapped successfully with PIV slot 9d")
+		protocol.HumanMessage("  PIV serial:     %s", result.PIVDeviceSerial)
+		protocol.HumanMessage("  Plaintext (b64): %s", result.PlaintextKeyB64)
+	}
+}
+
+func runEnclaveWrap(args []string) {
+  flags := flag.NewFlagSet("enclave-wrap", flag.ExitOnError)
+  json_output := flags.Bool("json", false, "output JSON")
+  plaintext_key_data_base64 := flags.String("data", "", "base64-encoded key to wrap (16-128 bytes, multiple of 8)")
+  flags.Parse(args)
+
+  if *plaintext_key_data_base64 == "" {
+    protocol.ErrorResponse("MISSING_DATA", "enclave-wrap requires --data <base64>")
+    os.Exit(1)
+  }
+
+  result, err := enclave.WrapKeyWithEnclave(*plaintext_key_data_base64)
+  if err != nil {
+    protocol.ErrorResponse("ENCLAVE_WRAP_FAILED", err.Error())
+    os.Exit(1)
+  }
+
+  if *json_output {
+    protocol.SuccessResponse(result)
+  } else {
+    protocol.HumanMessage("Key wrapped with Secure Enclave ECDH + AES-256 Key Wrap")
+    protocol.HumanMessage("  Algorithm:         %s", result.Algorithm)
+    protocol.HumanMessage("  Plaintext size:    %d bytes", result.PlaintextKeySizeBytes)
+    protocol.HumanMessage("  Ephemeral pub:     %s", result.EphemeralPublicKeyBase64)
+    protocol.HumanMessage("  Wrapped key:       %s", result.WrappedKeyBase64)
+    protocol.HumanMessage("  Enclave pub (b64): %s", result.EnclavePublicKeyBase64)
+  }
+}
+
+func runEnclaveUnwrap(args []string) {
+  flags := flag.NewFlagSet("enclave-unwrap", flag.ExitOnError)
+  json_output := flags.Bool("json", false, "output JSON")
+  ephemeral_public_key_base64 := flags.String("ephemeral-pub", "", "ephemeral public key from enclave-wrap")
+  wrapped_key_base64 := flags.String("wrapped-key", "", "wrapped ciphertext from enclave-wrap")
+  flags.Parse(args)
+
+  if *ephemeral_public_key_base64 == "" {
+    protocol.ErrorResponse("MISSING_EPHEMERAL_PUB", "enclave-unwrap requires --ephemeral-pub <base64>")
+    os.Exit(1)
+  }
+  if *wrapped_key_base64 == "" {
+    protocol.ErrorResponse("MISSING_WRAPPED_KEY", "enclave-unwrap requires --wrapped-key <base64>")
+    os.Exit(1)
+  }
+
+  result, err := enclave.UnwrapKeyWithEnclave(*ephemeral_public_key_base64, *wrapped_key_base64)
+  if err != nil {
+    protocol.ErrorResponse("ENCLAVE_UNWRAP_FAILED", err.Error())
+    os.Exit(1)
+  }
+
+  if *json_output {
+    protocol.SuccessResponse(result)
+  } else {
+    protocol.HumanMessage("Key unwrapped successfully with Secure Enclave")
+    protocol.HumanMessage("  Plaintext (b64): %s", result.PlaintextKeyBase64)
+    protocol.HumanMessage("  Plaintext size:  %d bytes", result.PlaintextKeySizeBytes)
+  }
 }
 
 // runVersion prints version info.

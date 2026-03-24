@@ -178,6 +178,95 @@ func command_test() {
   }
 }
 
+func get_keywrap_key_file_path(application_tag: String) throws -> URL {
+  let safe_filename = application_tag
+    .replacingOccurrences(of: "/", with: "_")
+    .replacingOccurrences(of: "..", with: "_")
+  return try get_key_storage_directory().appendingPathComponent("\(safe_filename).keywrap.key")
+}
+
+func export_keywrap_public_key_as_pem(_ public_key: P256.KeyAgreement.PublicKey) -> String {
+  let raw_representation = public_key.x963Representation
+  let asn1_header: [UInt8] = [
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86,
+    0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03,
+    0x42, 0x00
+  ]
+  let spki_der = Data(asn1_header) + raw_representation
+  let encoding_options: Data.Base64EncodingOptions = [.lineLength64Characters, .endLineWithLineFeed]
+  let base64_encoded = spki_der.base64EncodedString(options: encoding_options)
+  return "-----BEGIN PUBLIC KEY-----\n\(base64_encoded)\n-----END PUBLIC KEY-----\n"
+}
+
+func load_or_create_keywrap_key(application_tag: String) throws -> SecureEnclave.P256.KeyAgreement.PrivateKey {
+  let key_file_path = try get_keywrap_key_file_path(application_tag: application_tag)
+
+  if FileManager.default.fileExists(atPath: key_file_path.path) {
+    let stored_key_data = try Data(contentsOf: key_file_path)
+    return try SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: stored_key_data)
+  }
+
+  let private_key = try SecureEnclave.P256.KeyAgreement.PrivateKey()
+  try private_key.dataRepresentation.write(to: key_file_path)
+  try FileManager.default.setAttributes(
+    [.posixPermissions: 0o600], ofItemAtPath: key_file_path.path)
+  return private_key
+}
+
+func command_keywrap_pubkey(application_tag: String) {
+  guard SecureEnclave.isAvailable else {
+    output_error("SE_NOT_AVAILABLE", "Secure Enclave is not available on this Mac")
+    return
+  }
+
+  do {
+    let private_key = try load_or_create_keywrap_key(application_tag: application_tag)
+    let public_key_pem = export_keywrap_public_key_as_pem(private_key.publicKey)
+    let x963_b64 = private_key.publicKey.x963Representation.base64EncodedString()
+
+    output_success([
+      "public_key_pem": public_key_pem,
+      "public_key_x963_b64": x963_b64,
+      "key_tag": application_tag,
+      "algorithm": "ecdh-p256"
+    ])
+  } catch {
+    output_error("SE_KEYWRAP_PUBKEY_FAILED", "Could not get keywrap public key: \(error)")
+  }
+}
+
+func command_ecdh(application_tag: String, peer_public_key_x963_base64: String) {
+  guard SecureEnclave.isAvailable else {
+    output_error("SE_NOT_AVAILABLE", "Secure Enclave is not available on this Mac")
+    return
+  }
+
+  do {
+    let private_key = try load_or_create_keywrap_key(application_tag: application_tag)
+
+    guard let peer_pub_data = Data(base64Encoded: peer_public_key_x963_base64) else {
+      output_error("INVALID_PEER_KEY", "Could not decode peer public key from base64")
+      return
+    }
+
+    let peer_public_key = try P256.KeyAgreement.PublicKey(x963Representation: peer_pub_data)
+    let shared_secret = try private_key.sharedSecretFromKeyAgreement(with: peer_public_key)
+
+    let shared_secret_data: Data = shared_secret.withUnsafeBytes { ptr in
+      Data(ptr)
+    }
+
+    output_success([
+      "shared_secret_b64": shared_secret_data.base64EncodedString(),
+      "key_tag": application_tag,
+      "algorithm": "ecdh-p256"
+    ])
+  } catch {
+    output_error("SE_ECDH_FAILED", "Secure Enclave ECDH failed: \(error)")
+  }
+}
+
 func print_usage() {
   let usage = """
   oneid-se-helper: Secure Enclave operations for 1id.com
@@ -186,6 +275,8 @@ func print_usage() {
     oneid-se-helper detect
     oneid-se-helper generate --tag <application_tag>
     oneid-se-helper sign --tag <application_tag> --nonce <base64>
+    oneid-se-helper keywrap-pubkey --tag <application_tag>
+    oneid-se-helper ecdh --tag <application_tag> --peer-pub <base64>
     oneid-se-helper test
 
   All output is JSON on stdout.
@@ -225,6 +316,29 @@ case "sign":
     exit(1)
   }
   command_sign(application_tag: arguments[tag_index + 1], nonce_base64: arguments[nonce_index + 1])
+
+case "keywrap-pubkey":
+  guard let tag_index = arguments.firstIndex(of: "--tag"),
+        tag_index + 1 < arguments.count else {
+    output_error("MISSING_TAG", "keywrap-pubkey requires --tag <application_tag>")
+    exit(1)
+  }
+  command_keywrap_pubkey(application_tag: arguments[tag_index + 1])
+
+case "ecdh":
+  guard let tag_index = arguments.firstIndex(of: "--tag"),
+        tag_index + 1 < arguments.count else {
+    output_error("MISSING_TAG", "ecdh requires --tag <application_tag>")
+    exit(1)
+  }
+  guard let peer_pub_index = arguments.firstIndex(of: "--peer-pub"),
+        peer_pub_index + 1 < arguments.count else {
+    output_error("MISSING_PEER_PUB", "ecdh requires --peer-pub <base64>")
+    exit(1)
+  }
+  command_ecdh(
+    application_tag: arguments[tag_index + 1],
+    peer_public_key_x963_base64: arguments[peer_pub_index + 1])
 
 case "test":
   command_test()
