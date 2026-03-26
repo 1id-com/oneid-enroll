@@ -1,5 +1,8 @@
 # Makefile for oneid-enroll -- 1id.com HSM Identity Enrollment Helper
 #
+# CODE SIGNING IS MANDATORY after building. Unsigned binaries will be
+# blocked by OS security policies. See 001_readme.md "Code signing".
+#
 # IMPORTANT: go-piv (PIV/YubiKey) requires CGo (it calls into PCSC).
 # CGO_ENABLED=1 is mandatory for every build. Cross-compilation needs
 # the target platform's C toolchain + PCSC headers installed.

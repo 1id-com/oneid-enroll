@@ -1,8 +1,14 @@
+// CODE SIGNING IS MANDATORY for all binaries built from this source.
+// Unsigned binaries will be blocked by OS security (Windows SmartScreen,
+// macOS Gatekeeper/amfid, etc.) and will fail for end users.
+// See 001_readme.md "Code signing" section for per-platform instructions.
+//
 // oneid-enroll is the HSM helper binary for the 1id.com identity SDK.
 //
 // It handles all platform-specific hardware security module operations:
 // - TPM detection, EK extraction, AK generation, credential activation
-// - YubiKey/PIV detection (future)
+// - YubiKey/PIV detection, signing, key wrapping
+// - Apple Secure Enclave operations (via oneid-se-helper)
 // - Privilege elevation (UAC, sudo, pkexec, osascript)
 //
 // The Python and Node.js SDKs spawn this binary and communicate via

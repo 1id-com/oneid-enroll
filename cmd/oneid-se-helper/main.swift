@@ -1,3 +1,8 @@
+// CODE SIGNING IS MANDATORY for the binary built from this source.
+// macOS Gatekeeper and amfid will block unsigned binaries, preventing
+// all Secure Enclave operations for end users.
+// See 001_readme.md "Code signing" / "Mac (codesign + notarization)" section.
+
 import Foundation
 import CryptoKit
 
