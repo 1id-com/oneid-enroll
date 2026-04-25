@@ -17,6 +17,8 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"io"
+	"net/http"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
@@ -40,20 +42,211 @@ const (
 	nvIndexEKCertECCP256 = 0x01C0000A
 )
 
-// ExtractEKCertificate reads the EK certificate from the TPM's NV storage.
+// AMD EK certificate server (can be overridden for testing)
+var amdEKCertServerURL = "https://ftpm.amd.com/pki/aia"
+
+// ExtractEKCertificate reads the EK certificate from the TPM.
 //
-// REQUIRES ELEVATION.
+// For Intel/Infineon TPMs: reads from NV storage (requires elevation).
+// For AMD fTPMs: creates an EK and fetches certificate from AMD server.
 func ExtractEKCertificate(tpmTransport transport.TPMCloser) (*EKData, error) {
-	// Try RSA-2048 EK cert first (most common)
+	// Try NV storage first (Intel/Infineon discrete TPMs)
 	certDER, err := readNVCertificate(tpmTransport, nvIndexEKCertRSA2048)
-	if err != nil {
-		// Try ECC P-256 EK cert
-		certDER, err = readNVCertificate(tpmTransport, nvIndexEKCertECCP256)
-		if err != nil {
-			return nil, fmt.Errorf("no EK certificate found in TPM NV storage: %w", err)
-		}
+	if err == nil {
+		return parseEKData(certDER, nil)
 	}
 
+	// Try ECC EK cert from NV
+	certDER, err = readNVCertificate(tpmTransport, nvIndexEKCertECCP256)
+	if err == nil {
+		return parseEKData(certDER, nil)
+	}
+
+	// NV not available - try AMD fTPM (fetch from server)
+	return FetchAMDEKCertificate(tpmTransport)
+}
+
+// FetchAMDEKCertificate creates an EK in the TPM and fetches the certificate from AMD.
+//
+// AMD fTPM doesn't store EK certificates in NV. Instead, the certificate is
+// retrieved from AMD's server based on the EK public key hash.
+// This does NOT require elevation.
+func FetchAMDEKCertificate(tpmTransport transport.TPMCloser) (*EKData, error) {
+	// Create an ECC EK in the TPM
+	ekResult, err := CreateEKPublic(tpmTransport)
+	if err != nil {
+		return nil, fmt.Errorf("could not create EK in TPM: %w", err)
+	}
+
+	// Compute AMD EK certificate hash: sha256(0x0000_4444 || public_key)[0:16]
+	hash := computeAMDEKHash(ekResult.PublicKey)
+
+	// Fetch certificate from AMD server
+	certPEM, err := fetchFromAMDServer(hash)
+	if err != nil {
+		FlushEK(tpmTransport, ekResult.Handle)
+		return nil, fmt.Errorf("could not fetch AMD EK certificate: %w", err)
+	}
+
+	// Parse the certificate
+	cert, err := x509.ParseCertificate(certPEM)
+	if err != nil {
+		FlushEK(tpmTransport, ekResult.Handle)
+		return nil, fmt.Errorf("could not parse AMD EK certificate: %w", err)
+	}
+
+	// Flush the EK (don't need it anymore)
+	FlushEK(tpmTransport, ekResult.Handle)
+
+	return buildEKDataFromCert(cert, certPEM)
+}
+
+// computeAMDEKHash computes the AMD EK certificate hash.
+// Format: sha256(0x0000_4444 || public_key)[0:16] as hex string
+func computeAMDEKHash(ekPublic []byte) string {
+	// AMD uses 0x00004444 prefix for ECC EK certificates
+	prefix := []byte{0x00, 0x00, 0x44, 0x44}
+	data := append(prefix, ekPublic...)
+	hash := sha256.Sum256(data)
+	// Return first 16 bytes as hex
+	return hex.EncodeToString(hash[:16])
+}
+
+// fetchFromAMDServer fetches the EK certificate from AMD's server.
+func fetchFromAMDServer(hash string) ([]byte, error) {
+	url := amdEKCertServerURL + "/" + hash
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("AMD server returned status %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+// CreateEKPublicResult holds the result of creating an ECC EK.
+type CreateEKPublicResult struct {
+	PublicKey []byte
+	Handle    tpm2.TPMHandle
+}
+
+// CreateEKPublic creates a transient ECC EK in the TPM and returns its public key bytes.
+//
+// This is used for AMD fTPM which requires fetching the EK certificate from AMD's server.
+// The ECC EK is created using the standard TCG template.
+func CreateEKPublic(tpmTransport transport.TPMCloser) (*CreateEKPublicResult, error) {
+	ekTemplate := tpm2.TPMTPublic{
+		Type:    tpm2.TPMAlgECC,
+		NameAlg: tpm2.TPMAlgSHA256,
+		ObjectAttributes: tpm2.TPMAObject{
+			FixedTPM:            true,
+			FixedParent:         true,
+			SensitiveDataOrigin: true,
+			AdminWithPolicy:     true,
+			Restricted:          true,
+			Decrypt:             true,
+		},
+		Parameters: tpm2.NewTPMUPublicParms(
+			tpm2.TPMAlgECC,
+			&tpm2.TPMSECCParms{
+				Symmetric: tpm2.TPMTSymDefObject{
+					Algorithm: tpm2.TPMAlgAES,
+					KeyBits:   tpm2.NewTPMUSymKeyBits(tpm2.TPMAlgAES, tpm2.TPMKeyBits(128)),
+					Mode:      tpm2.NewTPMUSymMode(tpm2.TPMAlgAES, tpm2.TPMAlgCFB),
+				},
+				Scheme: tpm2.TPMTECCScheme{
+					Scheme: tpm2.TPMAlgECDSA,
+					Details: tpm2.NewTPMUAsymScheme(
+						tpm2.TPMAlgECDSA,
+						&tpm2.TPMSSigSchemeECDSA{
+							HashAlg: tpm2.TPMAlgSHA256,
+						},
+					),
+				},
+				CurveID: tpm2.TPMECCNistP256,
+			},
+		),
+		Unique: tpm2.NewTPMUPublicID(
+			tpm2.TPMAlgECC,
+			&tpm2.TPMSECCPoint{
+				X: tpm2.TPM2BECCParameter{Buffer: []byte{}},
+				Y: tpm2.TPM2BECCParameter{Buffer: []byte{}},
+			},
+		),
+	}
+
+	createEKCmd := tpm2.CreatePrimary{
+		PrimaryHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHEndorsement,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
+		InPublic: tpm2.New2B(ekTemplate),
+	}
+
+	ekResp, err := createEKCmd.Execute(tpmTransport)
+	if err != nil {
+		return nil, fmt.Errorf("could not create ECC EK: %w", err)
+	}
+
+	ekPublic, err := ekResp.OutPublic.Contents()
+	if err != nil {
+		return nil, fmt.Errorf("could not read EK public area: %w", err)
+	}
+
+	unique, err := ekPublic.Unique.ECC()
+	if err != nil {
+		return nil, fmt.Errorf("could not get ECC unique: %w", err)
+	}
+
+	pubBytes := append(unique.X.Buffer, unique.Y.Buffer...)
+	return &CreateEKPublicResult{
+		PublicKey: pubBytes,
+		Handle:    ekResp.ObjectHandle,
+	}, nil
+}
+
+// FlushEK flushes a transient EK from TPM memory.
+// Safe to call even if the handle is invalid (errors are silently ignored).
+func FlushEK(tpmTransport transport.TPMCloser, handle tpm2.TPMHandle) {
+	if handle == 0 {
+		return
+	}
+	flushCmd := tpm2.FlushContext{FlushHandle: handle}
+	_, _ = flushCmd.Execute(tpmTransport)
+}
+
+// buildEKDataFromCert creates EKData from an x509 certificate.
+func buildEKDataFromCert(cert *x509.Certificate, certPEMBytes []byte) (*EKData, error) {
+	pubKeyDER, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("could not marshal EK public key: %w", err)
+	}
+	pubKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: pubKeyDER,
+	})
+
+	fingerprint := sha256.Sum256(cert.Raw)
+
+	return &EKData{
+		CertificatePEM:   string(certPEMBytes),
+		PublicKeyPEM:     string(pubKeyPEM),
+		CertificateChain: nil,
+		Fingerprint:      hex.EncodeToString(fingerprint[:]),
+		SubjectCN:        cert.Subject.CommonName,
+		IssuerCN:         cert.Issuer.CommonName,
+		NotBefore:        cert.NotBefore.UTC().Format("2006-01-02T15:04:05Z"),
+		NotAfter:         cert.NotAfter.UTC().Format("2006-01-02T15:04:05Z"),
+	}, nil
+}
+
+// parseEKData parses EK certificate bytes into EKData struct.
+func parseEKData(certDER []byte, chain []string) (*EKData, error) {
 	cert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		return nil, fmt.Errorf("could not parse EK certificate: %w", err)
@@ -78,7 +271,7 @@ func ExtractEKCertificate(tpmTransport transport.TPMCloser) (*EKData, error) {
 	return &EKData{
 		CertificatePEM:   string(certPEM),
 		PublicKeyPEM:     string(pubKeyPEM),
-		CertificateChain: nil,
+		CertificateChain: chain,
 		Fingerprint:      hex.EncodeToString(fingerprint[:]),
 		SubjectCN:        cert.Subject.CommonName,
 		IssuerCN:         cert.Issuer.CommonName,
