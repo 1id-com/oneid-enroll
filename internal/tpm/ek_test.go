@@ -54,15 +54,14 @@ func TestComputeAMDEKHash_Deterministic(t *testing.T) {
 }
 
 func TestFetchFromAMDServer_Success(t *testing.T) {
-	// Start a test server that simulates AMD's response
-	certContent := "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
+	// AMD's server returns DER-encoded certificates (not PEM).
+	certContent := []byte{0x30, 0x82, 0x01, 0x00, 0xde, 0xad, 0xbe, 0xef}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(certContent))
+		w.Write(certContent)
 	}))
 	defer server.Close()
 
-	// Save original URL and restore after test
 	originalURL := amdEKCertServerURL
 	amdEKCertServerURL = server.URL
 	defer func() { amdEKCertServerURL = originalURL }()
@@ -71,8 +70,8 @@ func TestFetchFromAMDServer_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetchFromAMDServer() error = %v", err)
 	}
-	if string(result) != certContent {
-		t.Errorf("fetchFromAMDServer() = %q, want %q", string(result), certContent)
+	if string(result) != string(certContent) {
+		t.Errorf("fetchFromAMDServer() = %x, want %x", result, certContent)
 	}
 }
 
@@ -105,5 +104,22 @@ func TestFetchFromAMDServer_ServerError(t *testing.T) {
 	_, err := fetchFromAMDServer("errorhash")
 	if err == nil {
 		t.Error("fetchFromAMDServer() expected error for 500")
+	}
+}
+
+func TestFetchFromAMDServer_ResponseTooLarge(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(make([]byte, maxAMDEKCertBytes+1))
+	}))
+	defer server.Close()
+
+	originalURL := amdEKCertServerURL
+	amdEKCertServerURL = server.URL
+	defer func() { amdEKCertServerURL = originalURL }()
+
+	_, err := fetchFromAMDServer("toolarge")
+	if err == nil {
+		t.Error("fetchFromAMDServer() expected error for oversized response")
 	}
 }
