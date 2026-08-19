@@ -815,34 +815,21 @@ func runActivate(args []string) {
 		}
 	}
 
-	// On Windows: try the TPM at current privilege level first.
-	// With transient-only architecture, no elevation is needed for ActivateCredential
-	// (after one-time TBS setup).
-	if *wantElevation && !elevate.IsRunningElevated() && runtime.GOOS == "windows" {
-		tpm_probe, tpm_probe_err := transport.OpenTPM()
-		if tpm_probe_err == nil {
-			tpm_probe.Close()
-			protocol.HumanMessage("TPM accessible without elevation -- skipping UAC")
-			*wantElevation = false
-		} else {
-			tbs_is_configured, _ := tbs.CheckTBSAccessIsGrantedToNonAdminUsers()
-			if !tbs_is_configured {
-				protocol.HumanMessage("TPM not accessible -- configuring TBS for non-admin access (one-time setup)...")
-				exit_code, _, setup_err := elevate.RunSubcommandElevated([]string{"setup-tbs", "--json"})
-				if setup_err == nil && exit_code == 0 {
-					tpm_retry, retry_err := transport.OpenTPM()
-					if retry_err == nil {
-						tpm_retry.Close()
-						protocol.HumanMessage("TBS configured -- TPM now accessible without elevation")
-						*wantElevation = false
-					}
-				}
-			}
+	// On Windows: ensure TBS is configured so we can open the TPM (even
+	// if we later need elevation for ActivateCredential itself).
+	if runtime.GOOS == "windows" && !elevate.IsRunningElevated() {
+		tbs_is_configured, _ := tbs.CheckTBSAccessIsGrantedToNonAdminUsers()
+		if !tbs_is_configured {
+			protocol.HumanMessage("TPM not accessible -- configuring TBS for non-admin access (one-time setup)...")
+			elevate.RunSubcommandElevated([]string{"setup-tbs", "--json"})
 		}
 	}
 
+	// If we were told to elevate and we're not yet elevated, do so now.
+	// This path is used when the SDK knows elevation is needed (e.g. after
+	// a previous TBS_COMMAND_BLOCKED failure).
 	if *wantElevation && !elevate.IsRunningElevated() {
-		protocol.HumanMessage("Requesting administrator privileges...")
+		protocol.HumanMessage("Requesting administrator privileges for ActivateCredential...")
 		if err := elevate.RelaunchElevated(); err != nil {
 			if *jsonOutput {
 				protocol.ErrorResponse("UAC_DENIED", err.Error())
@@ -898,6 +885,39 @@ func runActivate(args []string) {
 			*encryptedSecretB64,
 		)
 	}
+
+	// On Windows: if ActivateCredential fails with TBS_E_COMMAND_BLOCKED
+	// (0x80280400), the command requires admin privileges. Auto-elevate and
+	// retry via RunSubcommandElevated rather than failing outright.
+	if err != nil && runtime.GOOS == "windows" && !elevate.IsRunningElevated() &&
+		strings.Contains(err.Error(), "0x80280400") {
+		tpmDevice.Close()
+		protocol.HumanMessage("ActivateCredential blocked by TBS -- requesting administrator privileges...")
+		elevated_args := []string{"activate", "--json",
+			"--credential-blob", *credentialBlobB64,
+			"--encrypted-secret", *encryptedSecretB64}
+		if !use_transient_ak {
+			elevated_args = append(elevated_args, "--ak-handle", *akHandleStr)
+		}
+		exit_code, captured_output, elevate_err := elevate.RunSubcommandElevated(elevated_args)
+		if elevate_err != nil || exit_code != 0 {
+			if *jsonOutput {
+				if len(captured_output) > 0 {
+					os.Stdout.Write(captured_output)
+				} else {
+					protocol.ErrorResponse("ACTIVATE_CREDENTIAL_FAILED",
+						fmt.Sprintf("TPM2_ActivateCredential requires admin privileges and elevation failed: %v", elevate_err))
+				}
+			} else {
+				protocol.HumanMessage("Error: ActivateCredential requires admin and elevation failed: %v", elevate_err)
+				os.Exit(1)
+			}
+			return
+		}
+		os.Stdout.Write(captured_output)
+		return
+	}
+
 	if err != nil {
 		if *jsonOutput {
 			protocol.ErrorResponse("ACTIVATE_CREDENTIAL_FAILED", fmt.Sprintf("TPM2_ActivateCredential failed: %v", err))
