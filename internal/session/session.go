@@ -32,10 +32,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/1id-com/oneid-enroll/internal/tbs"
 	"github.com/1id-com/oneid-enroll/internal/tpm"
 	"github.com/google/go-tpm/tpm2/transport"
 )
@@ -94,6 +96,17 @@ func RunSession(reader io.Reader, writer io.Writer, expectedSessionToken string)
 	if expectedSessionToken != "" {
 		if !authenticateConnection(scanner, writer, expectedSessionToken) {
 			return fmt.Errorf("session authentication failed")
+		}
+	}
+
+	// ── Step 1.5: Configure TBS while elevated ──
+	// The session runs elevated (admin). Use this opportunity to set the
+	// TBS SecurityDescriptor so that future non-elevated operations
+	// (sign, detect) work without UAC.
+	if runtime.GOOS == "windows" {
+		tbs_already_configured, _ := tbs.CheckTBSAccessIsGrantedToNonAdminUsers()
+		if !tbs_already_configured {
+			_ = tbs.GrantTBSAccessToNonAdminUsersViaRegistryKey()
 		}
 	}
 

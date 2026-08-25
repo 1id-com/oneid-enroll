@@ -116,7 +116,7 @@ func validateOutputFilePath(outputFilePath string) error {
 	return nil
 }
 
-var version = "1.1.0"
+var version = "1.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -1208,30 +1208,12 @@ func runSession(args []string) {
 		*wantElevation = false
 	}
 
-	// On Windows: try TPM at current privilege first, setup TBS if needed.
-	if *wantElevation && !elevate.IsRunningElevated() && runtime.GOOS == "windows" {
-		tpm_probe, tpm_probe_err := transport.OpenTPM()
-		if tpm_probe_err == nil {
-			tpm_probe.Close()
-			protocol.HumanMessage("TPM accessible without elevation -- skipping UAC")
-			*wantElevation = false
-		} else {
-			tbs_is_configured, _ := tbs.CheckTBSAccessIsGrantedToNonAdminUsers()
-			if !tbs_is_configured {
-				protocol.HumanMessage("TPM not accessible -- configuring TBS for non-admin access (one-time setup)...")
-				exit_code, _, setup_err := elevate.RunSubcommandElevated([]string{"setup-tbs", "--json"})
-				if setup_err == nil && exit_code == 0 {
-					tpm_retry, retry_err := transport.OpenTPM()
-					if retry_err == nil {
-						tpm_retry.Close()
-						protocol.HumanMessage("TBS configured -- TPM now accessible without elevation")
-						*wantElevation = false
-					}
-				}
-			}
-		}
-	}
-
+	// Session mode always elevates when --elevated is set.
+	// Unlike standalone extract (which can skip elevation when OpenTPM works),
+	// the session exists specifically because ActivateCredential requires
+	// elevation on Windows regardless of TBS configuration. Cancelling
+	// elevation based on an OpenTPM probe would leave the session unable
+	// to run ActivateCredential, defeating its purpose.
 	if *wantElevation && !elevate.IsRunningElevated() {
 		protocol.HumanMessage("Requesting administrator privileges...")
 		if err := elevate.RelaunchElevated(); err != nil {
