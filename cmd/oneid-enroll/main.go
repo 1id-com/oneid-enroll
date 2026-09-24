@@ -116,7 +116,7 @@ func validateOutputFilePath(outputFilePath string) error {
 	return nil
 }
 
-var version = "1.2.0"
+var version = "2.0.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -132,8 +132,10 @@ func main() {
 		runDetect(subArgs)
 	case "extract":
 		runExtract(subArgs)
-	case "activate":
-		runActivate(subArgs)
+	case "import-certify":
+		runImportCertify(subArgs)
+	case "activate", "setup-tbs", "session":
+		runRetiredElevationCommand(subcommand, subArgs)
 	case "sign":
 		runSign(subArgs)
 	case "piv-sign":
@@ -142,10 +144,6 @@ func main() {
 		runTPMBindQuote(subArgs)
 	case "piv-bind-ceremony":
 		runPIVBindCeremony(subArgs)
-	case "setup-tbs":
-		runSetupTBS(subArgs)
-	case "session":
-		runSession(subArgs)
 	case "version":
 		runVersion(subArgs)
 	case "seal":
@@ -176,19 +174,21 @@ func printUsage() {
 
 Usage:
   oneid-enroll detect    [--json]                          Detect available HSMs (TPM + PIV)
-  oneid-enroll setup-tbs [--json] [--elevated]             One-time: grant non-admin TBS access (Windows)
-  oneid-enroll extract   [--json] [--elevated]             Extract attestation data
-                         [--type tpm|yubikey|enclave]        tpm: EK cert + AK
+  oneid-enroll extract   [--json]                          Extract attestation data (NO elevation)
+                         [--type tpm|yubikey|enclave]        tpm: RSA EK cert + on-TPM EK chain + AK
                                                              yubikey: PIV attestation (no elevation)
                                                              enclave: Secure Enclave P-256 key (macOS)
-  oneid-enroll activate  [--json] [--elevated]             Decrypt credential challenge (TPM only)
-                         --credential-blob <b64>
-                         --encrypted-secret <b64>
-                         --ak-handle <hex>
+  oneid-enroll import-certify [--json]                     Enrollment proof (TPM, NO elevation):
+                         --wrapped-object-public <b64>       import the Registrar-wrapped object under
+                         --wrapped-object-duplicate <b64>    the EK and certify it with the AK over
+                         --wrapped-object-in-sym-seed <b64>  the Registrar nonce
+                         --certify-nonce <b64>
   oneid-enroll sign      [--json]                          Sign a challenge nonce (NO elevation)
                          --nonce <b64>
-                         [--type tpm|yubikey]                tpm: requires --ak-handle
-                         [--ak-handle <hex>]                 yubikey: uses slot 9a automatically
+                         [--type tpm|yubikey]                tpm: transient AK (re-created each time)
+                                                             yubikey: uses slot 9a automatically
+                         [--serial <num>]                    target a specific YubiKey by serial number
+                         [--reader <substring>]              target a specific YubiKey by reader name
                          [--output-clock]                    (tpm only) also TPM Quote for clock capture
   oneid-enroll piv-sign  [--json]                          Sign arbitrary data with PIV slot 9a
                          --data <b64>
@@ -212,15 +212,16 @@ Usage:
   oneid-enroll enclave-unwrap [--json]                     Unwrap key with Secure Enclave ECDH + AES-KW
                          --ephemeral-pub <b64>               ephemeral public key from enclave-wrap
                          --wrapped-key <b64>                 wrapped ciphertext from enclave-wrap
-  oneid-enroll session   [--elevated] [--pipe <name>]      Interactive session (one UAC, TPM only)
   oneid-enroll version   [--json]                          Print version
   oneid-enroll help                                        Print this help
 
 Flags:
   --json       Output JSON to stdout (for SDK consumption)
-  --elevated   Trigger UAC/sudo if not already running as admin
   --type       HSM type: tpm (default), yubikey, or enclave
-  --pipe       Named pipe for session I/O (Windows; Linux/macOS uses stdin/stdout)`)
+
+Retired (2.0.0): activate, setup-tbs, session -- enrollment uses import-certify,
+which needs no elevation; the TBS registry values setup-tbs wrote are obsolete
+since Windows 8 and are no longer touched.`)
 }
 
 // runSetupTBS configures the Windows registry to allow non-admin users
@@ -440,53 +441,12 @@ func runExtract(args []string) {
 		os.Stdout = f
 	}
 
-	// If already elevated (child of UAC), treat as elevated
-	if *alreadyElevated {
-		*wantElevation = false // Don't try to elevate again -- we already are
-	}
-
-	// On Windows for TPM: try accessing the TPM at current privilege level first.
-	// With transient-only AK architecture, CreatePrimary does NOT need elevation
-	// (after one-time TBS setup). So if OpenTPM works, skip UAC entirely.
-	//
-	// Result:
-	//   - 0 UAC prompts when TBS was previously configured
-	//   - 1 UAC prompt on first-ever use (to set the TBS registry key)
-	//   - Never 2+ prompts
-	if *wantElevation && !elevate.IsRunningElevated() && runtime.GOOS == "windows" && (*hsmType == "tpm" || *hsmType == "") {
-		tpm_probe, tpm_probe_err := transport.OpenTPM()
-		if tpm_probe_err == nil {
-			tpm_probe.Close()
-			protocol.HumanMessage("TPM accessible without elevation -- skipping UAC")
-			*wantElevation = false
-		} else {
-			tbs_is_configured, _ := tbs.CheckTBSAccessIsGrantedToNonAdminUsers()
-			if !tbs_is_configured {
-				protocol.HumanMessage("TPM not accessible -- configuring TBS for non-admin access (one-time setup)...")
-				exit_code, _, setup_err := elevate.RunSubcommandElevated([]string{"setup-tbs", "--json"})
-				if setup_err == nil && exit_code == 0 {
-					tpm_retry, retry_err := transport.OpenTPM()
-					if retry_err == nil {
-						tpm_retry.Close()
-						protocol.HumanMessage("TBS configured -- TPM now accessible without elevation")
-						*wantElevation = false
-					}
-				}
-			}
-		}
-	}
-
-	if *wantElevation && !elevate.IsRunningElevated() {
-		protocol.HumanMessage("Requesting administrator privileges...")
-		if err := elevate.RelaunchElevated(); err != nil {
-			if *jsonOutput {
-				protocol.ErrorResponse("UAC_DENIED", err.Error())
-			} else {
-				protocol.HumanMessage("Elevation failed: %v", err)
-				os.Exit(1)
-			}
-		}
-		return // unreachable -- RelaunchElevated calls os.Exit
+	// Extraction never elevates (tracker C10 R-A): EK/NV reads and transient
+	// CreatePrimary work as an ordinary user on Windows 10/11 (verified
+	// 2026-09-24). --elevated / _already-elevated are accepted but ignored.
+	_ = alreadyElevated
+	if *wantElevation {
+		protocol.HumanMessage("Note: --elevated is ignored; extraction never needs elevation")
 	}
 
 	switch *hsmType {
@@ -534,19 +494,6 @@ func runExtractTPM(jsonOutput bool) {
 	// Open TPM
 	tpmDevice, err := transport.OpenTPM()
 	if err != nil {
-		tbs_access_is_configured, _ := tbs.CheckTBSAccessIsGrantedToNonAdminUsers()
-		if !tbs_access_is_configured && !elevate.IsRunningElevated() {
-			if jsonOutput {
-				protocol.ErrorResponse("TBS_ACCESS_DENIED",
-					"TPM detected but TBS access is not configured for non-admin users. "+
-						"Run 'oneid-enroll setup-tbs --elevated --json' first (one-time setup).")
-			} else {
-				protocol.HumanMessage("Error: TPM access denied. TBS is not configured for non-admin users.")
-				protocol.HumanMessage("Run: oneid-enroll setup-tbs --elevated")
-				os.Exit(1)
-			}
-			return
-		}
 		if jsonOutput {
 			protocol.ErrorResponse("NO_HSM_FOUND", fmt.Sprintf("Could not open TPM: %v", err))
 		} else {
@@ -951,6 +898,8 @@ func runSign(args []string) {
 	hsmType := flags.String("type", "tpm", "HSM type: tpm or yubikey")
 	outputClock := flags.Bool("output-clock", false, "also perform TPM Quote for clock capture [TPM only]")
 	certChainFile := flags.String("cert-chain-file", "", "path to PEM certificate chain file (included in proof bundle output)")
+	pivReaderSubstring := flags.String("reader", "", "PC/SC reader name substring to target a specific YubiKey [PIV only]")
+	pivSerialNumberStr := flags.String("serial", "", "YubiKey serial number to target a specific device [PIV only]")
 	flags.Parse(args)
 
 	if *nonceB64 == "" {
@@ -979,6 +928,24 @@ func runSign(args []string) {
 		identity_certificate_chain_pem = string(chain_bytes)
 	}
 
+	// Build PIV device target options from --reader / --serial flags
+	var piv_device_target_options *piv.PIVDeviceTargetOptions
+	if *pivSerialNumberStr != "" {
+		parsed_serial, parse_err := strconv.ParseUint(*pivSerialNumberStr, 10, 32)
+		if parse_err != nil {
+			if *jsonOutput {
+				protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf("--serial must be a numeric YubiKey serial: %v", parse_err))
+			} else {
+				protocol.HumanMessage("Error: --serial must be a numeric YubiKey serial: %v", parse_err)
+				os.Exit(1)
+			}
+			return
+		}
+		piv_device_target_options = &piv.PIVDeviceTargetOptions{TargetSerialNumber: uint32(parsed_serial)}
+	} else if *pivReaderSubstring != "" {
+		piv_device_target_options = &piv.PIVDeviceTargetOptions{ReaderNameSubstring: *pivReaderSubstring}
+	}
+
 	switch *hsmType {
 	case "yubikey", "piv":
 		if *outputClock {
@@ -990,7 +957,7 @@ func runSign(args []string) {
 			}
 			return
 		}
-		runSignPIV(*jsonOutput, *nonceB64, identity_certificate_chain_pem)
+		runSignPIV(*jsonOutput, *nonceB64, identity_certificate_chain_pem, piv_device_target_options)
 	case "tpm":
 		runSignTPM(*jsonOutput, *nonceB64, *akHandleStr, *outputClock, identity_certificate_chain_pem)
 	case "enclave", "secure_enclave":
@@ -1149,8 +1116,9 @@ func runSignTPM(jsonOutput bool, nonceB64 string, akHandleStr string, outputCloc
 }
 
 // runSignPIV signs a nonce with the PIV key in slot 9a.
-func runSignPIV(jsonOutput bool, nonceB64 string, identity_certificate_chain_pem string) {
-	result, err := piv.SignChallengeWithPIVKey(nonceB64)
+// When piv_device_target is non-nil, targets a specific YubiKey by serial or reader name.
+func runSignPIV(jsonOutput bool, nonceB64 string, identity_certificate_chain_pem string, piv_device_target *piv.PIVDeviceTargetOptions) {
+	result, err := piv.SignChallengeWithPIVKey(nonceB64, piv_device_target)
 	if err != nil {
 		if jsonOutput {
 			protocol.ErrorResponse("SIGN_FAILED", fmt.Sprintf("PIV signing failed: %v", err))
@@ -1915,4 +1883,73 @@ func runVersion(args []string) {
 	} else {
 		fmt.Printf("oneid-enroll version %s\n", version)
 	}
+}
+
+
+// runImportCertify performs the zero-elevation enrollment proof
+// (internal/tpm/import_certify.go) and prints certify_info + certify_signature.
+func runImportCertify(args []string) {
+	flags := flag.NewFlagSet("import-certify", flag.ExitOnError)
+	jsonOutput := flags.Bool("json", false, "output JSON")
+	wrappedObjectPublicB64 := flags.String("wrapped-object-public", "", "base64 TPMT_PUBLIC from the Registrar")
+	wrappedObjectDuplicateB64 := flags.String("wrapped-object-duplicate", "", "base64 TPM2B_PRIVATE contents from the Registrar")
+	wrappedObjectInSymSeedB64 := flags.String("wrapped-object-in-sym-seed", "", "base64 encrypted seed from the Registrar")
+	certifyNonceB64 := flags.String("certify-nonce", "", "base64 Registrar nonce")
+	flags.Parse(args)
+
+	fail := func(code string, message string) {
+		if *jsonOutput {
+			protocol.ErrorResponse(code, message)
+		} else {
+			protocol.HumanMessage("Error: %s", message)
+		}
+		os.Exit(1)
+	}
+	decode := func(name string, value string) []byte {
+		decoded, err := base64.StdEncoding.DecodeString(value)
+		if err != nil || len(decoded) == 0 {
+			fail("INVALID_ARGUMENT", fmt.Sprintf("--%s must be non-empty base64", name))
+		}
+		return decoded
+	}
+	objectPublic := decode("wrapped-object-public", *wrappedObjectPublicB64)
+	duplicate := decode("wrapped-object-duplicate", *wrappedObjectDuplicateB64)
+	inSymSeed := decode("wrapped-object-in-sym-seed", *wrappedObjectInSymSeedB64)
+	nonce := decode("certify-nonce", *certifyNonceB64)
+
+	tpmDevice, err := transport.OpenTPM()
+	if err != nil {
+		fail("NO_HSM_FOUND", fmt.Sprintf("Could not open TPM: %v", err))
+	}
+	defer tpmDevice.Close()
+
+	result, err := tpm.ImportAndCertifyWrappedObjectUnderEndorsementKey(tpmDevice, objectPublic, duplicate, inSymSeed, nonce)
+	if err != nil {
+		fail("IMPORT_CERTIFY_FAILED", err.Error())
+	}
+	if *jsonOutput {
+		protocol.SuccessResponse(map[string]string{
+			"certify_info":       base64.StdEncoding.EncodeToString(result.CertifyInfo),
+			"certify_signature":  base64.StdEncoding.EncodeToString(result.CertifySignature),
+			"ak_tpmt_public_b64": base64.StdEncoding.EncodeToString(result.AKTPMTPublic),
+			"loaded_object_name": fmt.Sprintf("%x", result.LoadedObjectName),
+		})
+		return
+	}
+	fmt.Println("certify_info=" + base64.StdEncoding.EncodeToString(result.CertifyInfo))
+	fmt.Println("certify_signature=" + base64.StdEncoding.EncodeToString(result.CertifySignature))
+}
+
+// runRetiredElevationCommand answers the commands removed in 2.0.0.
+func runRetiredElevationCommand(subcommand string, args []string) {
+	message := fmt.Sprintf("'%s' was retired in oneid-enroll 2.0.0: enrollment uses 'import-certify', "+
+		"which never needs elevation, and the TBS registry values are no longer changed", subcommand)
+	for _, argument := range args {
+		if argument == "--json" {
+			protocol.ErrorResponse("COMMAND_RETIRED", message)
+			return
+		}
+	}
+	protocol.HumanMessage("%s", message)
+	os.Exit(2)
 }

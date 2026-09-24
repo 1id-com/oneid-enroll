@@ -59,8 +59,9 @@ make verify         # verify all signatures
 
 ## Security
 
-- TPM operations require elevation (admin/sudo) -- the binary requests it automatically
-- The `--output-file` flag (used in elevated mode) strictly validates paths to prevent writes outside the system temp directory
+- No TPM operation needs elevation (2.0.0+): extraction, enrollment (`import-certify`: TPM2_Import/Load/Certify) and signing all run as the ordinary user on Windows 10/11 (verified 2026-09-24). The retired `activate` used TPM2_ActivateCredential, which Windows blocks for non-elevated processes; `setup-tbs` wrote TBS registry values that have been obsolete since Windows 8, and nothing on the user's machine is changed any more.
+- Keys are derived deterministically each time (transient CreatePrimary): no persistent TPM handles, no NV writes
+- The `--output-file` flag strictly validates paths to prevent writes outside the system temp directory
 - All hardware access code is read-only by design (detect, extract, generate)
 - No network access -- the binary never phones home
 

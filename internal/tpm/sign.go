@@ -1,3 +1,6 @@
+// CROSS_IMPL_SYNC: tpm_sign
+// Implementations: py:oneid/helper.py go:internal/tpm/sign.go node:src/helper.ts
+//
 // TPM signing operations for challenge-response authentication.
 //
 // After enrollment, agents authenticate to 1id.com by signing a server-provided

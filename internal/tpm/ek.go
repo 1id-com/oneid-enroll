@@ -4,8 +4,8 @@
 // It is the root of trust -- it proves the TPM is a real,
 // manufacturer-issued device, not a software emulation.
 //
-// Reading the EK certificate requires admin/root privileges because
-// it can be used to uniquely identify the device (privacy concern).
+// Reading the EK certificate works as an ordinary user on Windows (owner
+// hierarchy empty password; verified 2026-09-24) and via the tss group on Linux.
 //
 // This is the anti-Sybil mechanism: each EK is globally unique.
 // One EK = one identity. No duplicates allowed.
@@ -27,31 +27,40 @@ type EKData struct {
 	CertificatePEM   string   `json:"ek_cert_pem"`    // PEM-encoded X.509 certificate
 	PublicKeyPEM     string   `json:"ek_public_pem"`  // PEM-encoded public key (from cert)
 	CertificateChain []string `json:"chain_pem"`      // Intermediate CA certs (if found)
-	Fingerprint      string   `json:"ek_fingerprint"` // SHA-256 of DER-encoded certificate
+	Fingerprint      string   `json:"ek_fingerprint"` // SHA-256 of the EK SubjectPublicKeyInfo (anchor fingerprint)
 	SubjectCN        string   `json:"subject_cn"`     // Certificate subject common name
 	IssuerCN         string   `json:"issuer_cn"`      // Certificate issuer common name
 	NotBefore        string   `json:"not_before"`     // Validity start (ISO 8601)
 	NotAfter         string   `json:"not_after"`      // Validity end (ISO 8601)
 }
 
-// Well-known TPM NV indices for EK certificates (TCG PC Client spec)
+// Well-known TPM NV indices (TCG EK Credential Profile).
+//
+// The AIRS sovereign anchor profile (registry draft "Sovereign Tier") is the
+// TPM's RSA-2048 Endorsement Key with its manufacturer credential. ECC EK
+// credentials are deliberately NOT used as a fallback: an ECC anchor would be
+// a second, disjoint anchor for the same physical TPM.
+//
+// The manufacturer's intermediate CA certificates are commonly stored on the
+// TPM itself in the EK-chain NV range (Intel PTT: three concatenated DER
+// certificates at 0x01C00100). The Registrar needs them to reach its trust
+// store, which normally holds only the manufacturers' issuing roots.
 const (
-	nvIndexEKCertRSA2048 = 0x01C00002
-	nvIndexEKCertECCP256 = 0x01C0000A
+	nvIndexEKCertRSA2048        = 0x01C00002
+	nvIndexEKCertificateChainLo = 0x01C00100
+	nvIndexEKCertificateChainHi = 0x01C001FF
 )
 
-// ExtractEKCertificate reads the EK certificate from the TPM's NV storage.
+// ExtractEKCertificate reads the RSA-2048 EK certificate and the on-TPM EK
+// certificate chain from NV storage.
 //
-// REQUIRES ELEVATION.
+// Works as an ordinary (non-elevated) user: NV_ReadPublic + NV_Read with the
+// owner hierarchy's empty password are allowed by Windows command blocking
+// (verified on Windows 10 1809 and Windows 11 26200, 2026-09-24).
 func ExtractEKCertificate(tpmTransport transport.TPMCloser) (*EKData, error) {
-	// Try RSA-2048 EK cert first (most common)
 	certDER, err := readNVCertificate(tpmTransport, nvIndexEKCertRSA2048)
 	if err != nil {
-		// Try ECC P-256 EK cert
-		certDER, err = readNVCertificate(tpmTransport, nvIndexEKCertECCP256)
-		if err != nil {
-			return nil, fmt.Errorf("no EK certificate found in TPM NV storage: %w", err)
-		}
+		return nil, fmt.Errorf("no RSA EK certificate found in TPM NV storage (index 0x%08X): %w", nvIndexEKCertRSA2048, err)
 	}
 
 	cert, err := x509.ParseCertificate(certDER)
@@ -73,18 +82,81 @@ func ExtractEKCertificate(tpmTransport transport.TPMCloser) (*EKData, error) {
 		Bytes: pubKeyDER,
 	})
 
-	fingerprint := sha256.Sum256(certDER)
+	// Anchor fingerprint = SHA-256 over the EK SubjectPublicKeyInfo (registry
+	// draft "Anchor Fingerprint"), never over the certificate bytes.
+	fingerprint := sha256.Sum256(pubKeyDER)
 
 	return &EKData{
 		CertificatePEM:   string(certPEM),
 		PublicKeyPEM:     string(pubKeyPEM),
-		CertificateChain: nil,
+		CertificateChain: readEKCertificateChainFromNV(tpmTransport),
 		Fingerprint:      hex.EncodeToString(fingerprint[:]),
 		SubjectCN:        cert.Subject.CommonName,
 		IssuerCN:         cert.Issuer.CommonName,
 		NotBefore:        cert.NotBefore.UTC().Format("2006-01-02T15:04:05Z"),
 		NotAfter:         cert.NotAfter.UTC().Format("2006-01-02T15:04:05Z"),
 	}, nil
+}
+
+// readEKCertificateChainFromNV returns every certificate stored in the TPM's
+// EK-chain NV range, as PEM, in the order found. Missing or unreadable
+// indices are skipped: the chain is best-effort evidence the Registrar
+// verifies itself.
+func readEKCertificateChainFromNV(tpmTransport transport.TPMCloser) []string {
+	capability, err := tpm2.GetCapability{
+		Capability:    tpm2.TPMCapHandles,
+		Property:      nvIndexEKCertificateChainLo,
+		PropertyCount: 256,
+	}.Execute(tpmTransport)
+	if err != nil {
+		return nil
+	}
+	handles, err := capability.CapabilityData.Data.Handles()
+	if err != nil {
+		return nil
+	}
+	var chainPEMs []string
+	for _, handle := range handles.Handle {
+		nvIndex := uint32(handle)
+		if nvIndex < nvIndexEKCertificateChainLo || nvIndex > nvIndexEKCertificateChainHi {
+			continue
+		}
+		data, err := readNVCertificate(tpmTransport, nvIndex)
+		if err != nil {
+			continue
+		}
+		for _, certificateDER := range splitConcatenatedDERCertificates(data) {
+			chainPEMs = append(chainPEMs, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})))
+		}
+	}
+	return chainPEMs
+}
+
+// splitConcatenatedDERCertificates splits back-to-back DER SEQUENCEs.
+func splitConcatenatedDERCertificates(data []byte) [][]byte {
+	var certificates [][]byte
+	for offset := 0; offset+2 <= len(data) && data[offset] == 0x30; {
+		length := int(data[offset+1])
+		headerLength := 2
+		if length&0x80 != 0 {
+			lengthOctets := length & 0x7F
+			if lengthOctets == 0 || lengthOctets > 4 || offset+2+lengthOctets > len(data) {
+				break
+			}
+			length = 0
+			for _, octet := range data[offset+2 : offset+2+lengthOctets] {
+				length = length<<8 | int(octet)
+			}
+			headerLength += lengthOctets
+		}
+		end := offset + headerLength + length
+		if end > len(data) {
+			break
+		}
+		certificates = append(certificates, data[offset:end])
+		offset = end
+	}
+	return certificates
 }
 
 // readNVCertificate reads a certificate from a TPM NV index.

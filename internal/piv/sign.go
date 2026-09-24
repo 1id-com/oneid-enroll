@@ -1,3 +1,6 @@
+// CROSS_IMPL_SYNC: piv_sign
+// Implementations: py:oneid/helper.py go:internal/piv/sign.go node:src/helper.ts
+//
 // PIV challenge-response signing for ongoing authentication.
 //
 // After enrollment, agents authenticate to 1id.com by signing a
@@ -32,14 +35,25 @@ type PIVSignChallengeResult struct {
   SerialNumber    string `json:"serial_number"`
 }
 
-// SignChallengeWithPIVKey opens the first PIV device, retrieves the slot 9a
+// PIVDeviceTargetOptions specifies which PIV device to open when multiple
+// YubiKeys are connected. If both fields are empty/zero, falls back to
+// OpenFirstAvailablePIVDevice (original behavior). Serial takes precedence
+// over reader substring if both are specified.
+type PIVDeviceTargetOptions struct {
+  TargetSerialNumber uint32
+  ReaderNameSubstring string
+}
+
+// SignChallengeWithPIVKey opens a PIV device, retrieves the slot 9a
 // private key, and signs the given nonce using ECDSA-SHA256.
 //
 // The nonce_base64 parameter is a base64-encoded server-provided challenge.
+// The optional target parameter specifies which YubiKey to open when multiple
+// keys are connected. Pass nil to use the original first-available behavior.
 //
 // Returns the signature as base64-encoded ASN.1 DER (standard ECDSA format),
 // which the server can verify against the public key stored during enrollment.
-func SignChallengeWithPIVKey(nonce_base64 string) (*PIVSignChallengeResult, error) {
+func SignChallengeWithPIVKey(nonce_base64 string, target *PIVDeviceTargetOptions) (*PIVSignChallengeResult, error) {
   nonce_bytes, err := base64.StdEncoding.DecodeString(nonce_base64)
   if err != nil {
     return nil, fmt.Errorf("invalid base64 nonce: %w", err)
@@ -48,7 +62,14 @@ func SignChallengeWithPIVKey(nonce_base64 string) (*PIVSignChallengeResult, erro
     return nil, fmt.Errorf("nonce must be 1-1024 bytes, got %d", len(nonce_bytes))
   }
 
-  yubikey_connection, _, err := OpenFirstAvailablePIVDevice()
+  var yubikey_connection *gopiv.YubiKey
+  if target != nil && target.TargetSerialNumber != 0 {
+    yubikey_connection, _, err = OpenPIVDeviceBySerialNumber(target.TargetSerialNumber)
+  } else if target != nil && target.ReaderNameSubstring != "" {
+    yubikey_connection, _, err = OpenPIVDeviceByReaderNameSubstring(target.ReaderNameSubstring)
+  } else {
+    yubikey_connection, _, err = OpenFirstAvailablePIVDevice()
+  }
   if err != nil {
     return nil, err
   }
