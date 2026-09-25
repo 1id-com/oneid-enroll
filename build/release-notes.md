@@ -1,27 +1,23 @@
-# oneid-enroll v2.2.0 -- hardware-bound requests; every binary signed
+# oneid-enroll v2.2.1 -- YubiKey slot 9a is never overwritten
 
-**Required update** for `oneid` / `1id` SDK 3.1.0, which the SDKs fetch
-automatically (they require helper 2.2.0 or later).
+Recommended update. Works with `oneid` / `1id` SDK 3.1.0 and later (the SDKs
+fetch the latest helper automatically; SDK 3.1.2 verifies its publisher
+signature before use).
 
 ## What changed
 
-- **`sign` accepts up to 64 KiB.** 1ID access tokens are now sender-constrained:
-  every request that presents one carries an RFC 9421 HTTP Message Signature by
-  the enrolled key (registry-04 "HTTP Message Signatures"). The signature base
-  includes the whole `Authorization` header, which is larger than the 1024
-  bytes `TPM2_Hash` accepts. For longer input the helper now hashes inside the
-  TPM with `TPM2_HashSequenceStart` / `TPM2_SequenceUpdate` /
-  `TPM2_SequenceComplete`, which yields the same ticket the restricted
-  Attestation Key requires, so the key still never signs TPM-generated data.
-  Verified on Intel PTT (Windows 10), non-elevated. PIV signing (hashed in
-  software) accepts the same 64 KiB.
-- **Every macOS binary is Developer ID signed and notarized**, including the
-  Secure Enclave helpers `oneid-se-helper` (Intel) and `oneid-se-helper-arm64`
-  (Apple silicon), which earlier releases shipped only ad-hoc signed. The
-  release build now refuses to finish unless Gatekeeper accepts every macOS
-  binary as "Notarized Developer ID".
-- No change to enrollment (the v2.1.0 co-residency proof stands), no
-  elevation, no persistent TPM handles, no NV writes.
+- **Portable (YubiKey) enrollment never replaces an existing key.** The helper
+  generates a key in PIV slot 9a only when the card reports the slot as empty.
+  Any other attestation failure -- for example a key that was imported rather
+  than generated on the card (which cannot be attested), or a card that could
+  not be read -- now stops enrollment with an error instead of generating a new
+  key over the one already there. Before this release such a failure could
+  silently replace a key the owner was still using.
+  Verified on a YubiKey 4 (firmware 4.3.7) with an occupied slot: `extract`
+  reports `key_was_newly_generated: false` and the slot's public key is
+  unchanged.
+- No change to TPM or Secure Enclave behaviour, no elevation, no persistent TPM
+  handles, no NV writes.
 
 ## Downloads
 

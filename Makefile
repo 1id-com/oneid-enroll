@@ -26,7 +26,7 @@
 # The signing key (Ed25519, passwordless) lives in signing/gpg/ so that
 # "git pull" on any machine gives full signing capability.
 
-VERSION     ?= 2.2.0
+VERSION     ?= 2.2.1
 BINARY_NAME  = oneid-enroll
 MODULE       = github.com/1id-com/oneid-enroll
 CMD_DIR      = ./cmd/oneid-enroll

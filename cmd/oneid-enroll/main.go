@@ -116,7 +116,7 @@ func validateOutputFilePath(outputFilePath string) error {
 	return nil
 }
 
-var version = "2.2.0"
+var version = "2.2.1"
 
 func main() {
 	if len(os.Args) < 2 {
