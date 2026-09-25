@@ -1,11 +1,20 @@
 // Import-and-certify: the enrollment co-residency proof that needs NO elevation.
 //
-// The Registrar wraps a small data object for our certified Endorsement Key
-// (TPM 2.0 duplication format). We TPM2_Import + TPM2_Load it under the EK,
-// then TPM2_Certify it with our AK over the Registrar's nonce. Only the TPM
-// holding the EK private key can load the object, and a restricted AK only
-// signs TPM-generated attestations, so this proves the AK lives in the
-// certified TPM -- the same property TPM2_ActivateCredential proved.
+// The Registrar generates a restricted ECC P-256 SIGNING key and wraps it for
+// our certified Endorsement Key (TPM 2.0 duplication format, authPolicy that
+// can never be satisfied, so it can never be duplicated out again). We
+// TPM2_Import + TPM2_Load it under the EK, then have THAT key TPM2_Certify our
+// AK over the Registrar's nonce. The Registrar verifies the signature with the
+// key it generated itself: only the TPM holding the EK private key can have
+// loaded it, and a restricted key signs only TPM-generated attestations, so the
+// certified AK Name (with its fixedTPM/restricted attributes) and its
+// endorsement-hierarchy qualified Name are TPM-attested. That is the property
+// TPM2_ActivateCredential proves.
+//
+// oneid-enroll 2.0.0 had the AK certify the imported object instead. That
+// proved nothing about the AK: its attributes were the enrollee's claim and
+// every attested field was public, so software could forge it (external
+// review 2026-09-25, rfc/072 finding 1). Registrars reject that form.
 //
 // Why not ActivateCredential: Windows command blocking refuses it to
 // non-elevated processes, while Import, Load and Certify are allowed
@@ -25,8 +34,8 @@ import (
 
 // ImportAndCertifyResult is returned to the SDK, which forwards it to the Registrar.
 type ImportAndCertifyResult struct {
-	CertifyInfo      []byte // marshaled TPMS_ATTEST
-	CertifySignature []byte // RSASSA-PKCS1-v1_5 SHA-256 signature by the AK
+	CertifyInfo      []byte // marshaled TPMS_ATTEST certifying the AK
+	CertifySignature []byte // ECDSA P-256 SHA-256 signature r||s (32+32) by the imported Registrar key
 	AKTPMTPublic     []byte // our AK public area (for diagnostics)
 	LoadedObjectName []byte // Name of the imported object as computed by the TPM
 }
@@ -106,24 +115,36 @@ func ImportAndCertifyWrappedObjectUnderEndorsementKey(
 	}
 	defer tpm2.FlushContext{FlushHandle: loaded.ObjectHandle}.Execute(tpmTransport)
 
+	// The imported Registrar key certifies the AK (not the other way round).
 	certified, err := tpm2.Certify{
-		ObjectHandle:   tpm2.AuthHandle{Handle: loaded.ObjectHandle, Name: loaded.Name, Auth: tpm2.PasswordAuth(nil)},
-		SignHandle:     tpm2.AuthHandle{Handle: akData.TransientHandle, Name: akReadPublic.Name, Auth: tpm2.PasswordAuth(nil)},
+		ObjectHandle:   tpm2.AuthHandle{Handle: akData.TransientHandle, Name: akReadPublic.Name, Auth: tpm2.PasswordAuth(nil)},
+		SignHandle:     tpm2.AuthHandle{Handle: loaded.ObjectHandle, Name: loaded.Name, Auth: tpm2.PasswordAuth(nil)},
 		QualifyingData: tpm2.TPM2BData{Buffer: registrarNonce},
 		InScheme:       tpm2.TPMTSigScheme{Scheme: tpm2.TPMAlgNull},
 	}.Execute(tpmTransport)
 	if err != nil {
-		return nil, fmt.Errorf("TPM2_Certify by the AK failed: %w", err)
+		return nil, fmt.Errorf("TPM2_Certify of the AK by the imported Registrar key failed: %w", err)
 	}
-	rsaSignature, err := certified.Signature.Signature.RSASSA()
+	ecdsaSignature, err := certified.Signature.Signature.ECDSA()
 	if err != nil {
-		return nil, fmt.Errorf("AK signature is not RSASSA: %w", err)
+		return nil, fmt.Errorf("imported Registrar key signature is not ECDSA (is this a 2.1.0 challenge?): %w", err)
 	}
+	rawSignatureRS := append(leftPadTo32Bytes(ecdsaSignature.SignatureR.Buffer), leftPadTo32Bytes(ecdsaSignature.SignatureS.Buffer)...)
 
 	return &ImportAndCertifyResult{
 		CertifyInfo:      certified.CertifyInfo.Bytes(),
-		CertifySignature: rsaSignature.Sig.Buffer,
+		CertifySignature: rawSignatureRS,
 		AKTPMTPublic:     akData.TPMTPublicBytes,
 		LoadedObjectName: loaded.Name.Buffer,
 	}, nil
+}
+
+// leftPadTo32Bytes returns a P-256 scalar as exactly 32 big-endian octets.
+func leftPadTo32Bytes(value []byte) []byte {
+	if len(value) >= 32 {
+		return value[len(value)-32:]
+	}
+	padded := make([]byte, 32)
+	copy(padded[32-len(value):], value)
+	return padded
 }

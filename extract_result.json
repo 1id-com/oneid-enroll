@@ -1,4 +1,0 @@
-{
-  "error": "Could not generate AK: TPM2_EvictControl (persist AK) failed: TPM_RC_NV_DEFINED: NV Index or persistent object already defined",
-  "error_code": "HSM_ACCESS_ERROR"
-}

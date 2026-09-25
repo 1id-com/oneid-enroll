@@ -1,26 +1,30 @@
-# oneid-enroll v2.0.0 -- enrollment that never needs elevation
+# oneid-enroll v2.1.0 -- security fix for the TPM enrollment proof
 
-**Breaking release** (pairs with the `oneid` 3.0.0 Python SDK and the `1id`
-3.0.0 Node SDK).
+**Required update.** The 1id.com Registrar no longer accepts the enrollment
+proof produced by v2.0.0. If an SDK has cached v2.0.0, delete the cached helper
+(`%APPDATA%\oneid\bin\` on Windows, `~/.oneid/bin/` elsewhere) so the SDK
+downloads this release.
 
 ## What changed
 
-- **No TPM operation needs elevation any more (Windows 10 and 11).** Sovereign
-  enrollment proves that the attestation key lives in the TPM holding the
-  certified Endorsement Key with an import-and-certify ceremony
-  (TPM2_Import + TPM2_Load under the EK, then TPM2_Certify by the AK over the
-  Registrar's nonce). Windows blocks TPM2_ActivateCredential for non-elevated
-  processes; import-and-certify runs as the ordinary user. New command:
-  `import-certify`.
-- **Nothing on the machine is changed.** The retired `setup-tbs` command wrote
-  TBS registry values that have been obsolete since Windows 8. `activate`,
-  `setup-tbs` and the elevated `session` are retired; `extract` never elevates.
-- **Sovereign Profile v1 anchor.** The helper reads the RSA-2048 EK certificate
-  (NV 0x01C00002) and the manufacturer intermediate chain stored on the TPM
-  (NV 0x01C00100..0x01C001FF, e.g. Intel PTT), and reports the anchor
-  fingerprint as SHA-256 of the EK SubjectPublicKeyInfo.
-- Keys are derived deterministically each time (transient CreatePrimary): no
-  persistent TPM handles, no NV writes.
+- **The TPM co-residency proof is corrected.** In v2.0.0 the Attestation Key
+  certified an object the Registrar had wrapped for the Endorsement Key. That
+  did not prove anything about the Attestation Key: its attributes were the
+  enrollee's own claim and every attested field was public, so software could
+  forge the attestation (found by an external review on 2026-09-25; no
+  third-party enrollment used the flaw). Now the Registrar wraps a restricted
+  ECDSA P-256 *signing key* for the Endorsement Key; the helper imports it
+  under the EK and uses it to `TPM2_Certify` the Attestation Key over the
+  Registrar's nonce. Only the TPM holding the EK private key can load that key,
+  and a restricted key signs only TPM-generated attestations, so the
+  Registrar's check (with the key it generated) proves that the Attestation Key
+  lives in the certified TPM.
+- **Still no elevation.** The ceremony uses only TPM2_Import, TPM2_Load and
+  TPM2_Certify, which Windows allows to ordinary users (verified on Windows 10
+  and Windows 11 with Intel PTT, non-elevated). Keys stay transient: no
+  persistent handles, no NV writes.
+- `import-certify` keeps its arguments and output fields; `certify_signature`
+  is now an ECDSA P-256 `r||s` signature by the imported Registrar key.
 
 ## Downloads
 
@@ -28,11 +32,11 @@
 |---|---|---|
 | Windows x64 | `oneid-enroll-windows-amd64.exe` | Authenticode (Certum) + GPG |
 | Linux x64 | `oneid-enroll-linux-amd64` | GPG |
-| Linux ARM64 | `oneid-enroll-linux-arm64` | GPG |
-| macOS Intel | `oneid-enroll-darwin-amd64` (+ notarized `.zip`) | Apple Developer ID + notarization, GPG |
-| macOS Apple silicon | `oneid-enroll-darwin-arm64` (+ notarized `.zip`) | Apple Developer ID + notarization, GPG |
-| macOS Secure Enclave helper | `oneid-se-helper`, `oneid-se-helper-arm64` | unchanged from v1.1.0 |
+| Linux arm64 | `oneid-enroll-linux-arm64` | GPG |
+| macOS Intel | `oneid-enroll-darwin-amd64` (+ `.zip`) | Developer ID + notarized + GPG |
+| macOS Apple Silicon | `oneid-enroll-darwin-arm64` (+ `.zip`) | Developer ID + notarized + GPG |
+| macOS Secure Enclave helper | `oneid-se-helper`, `oneid-se-helper-arm64` | GPG |
 
-Each file has a `.sha256` checksum with a detached GPG signature
-(`.sha256.asc`); `SHA256SUMS` + `SHA256SUMS.asc` cover everything. The
-signing key (`releases@1id.com`) is in `signing/release-signing-key.pub.asc`.
+Every file has a `.sha256` and a GPG `.sha256.asc` (key `releases@1id.com`,
+fingerprint `F8516F1FA6E36EAD2263C0F79B5C12DDE66D4B6B`); `SHA256SUMS` and
+`SHA256SUMS.asc` cover them all.

@@ -15,3 +15,8 @@ signing/gpg/pubring.kbx~
 
 # Makefile sync marker (not part of the source)
 DANGER-IMPORTANT-READ-FIRST.md
+# Release binaries live only in build/ (signed); never at the source root
+/oneid-enroll-*
+/oneid-enroll.exe.sha256
+*.deb
+/extract_result.json
