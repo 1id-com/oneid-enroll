@@ -58,8 +58,12 @@ func SignChallengeWithPIVKey(nonce_base64 string, target *PIVDeviceTargetOptions
   if err != nil {
     return nil, fmt.Errorf("invalid base64 nonce: %w", err)
   }
-  if len(nonce_bytes) == 0 || len(nonce_bytes) > 1024 {
-    return nil, fmt.Errorf("nonce must be 1-1024 bytes, got %d", len(nonce_bytes))
+  // 64 KiB, as for TPM signing: an RFC 9421 signature base (registry-04
+  // "HTTP Message Signatures") carries the whole JWT Authorization header and
+  // exceeds 1024 bytes. SHA-256 is computed in software below, so the token
+  // itself has no input-size limit here.
+  if len(nonce_bytes) == 0 || len(nonce_bytes) > 64*1024 {
+    return nil, fmt.Errorf("data to sign must be 1-65536 bytes, got %d", len(nonce_bytes))
   }
 
   var yubikey_connection *gopiv.YubiKey

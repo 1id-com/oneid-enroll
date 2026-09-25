@@ -77,6 +77,84 @@ func SignChallengeWithAK(
   return signWithAKHandle(tpmTransport, tpm2.TPMHandle(akHandle), nonceBase64)
 }
 
+// maximumSignedInputOctets bounds what `sign` accepts. Challenge nonces are
+// 32 bytes, but an RFC 9421 HTTP Message Signature base (registry-04 "HTTP
+// Message Signatures": it covers the whole Authorization header, i.e. the
+// JWT access token) is typically 1.5-3 KB -- above TPM2_Hash's
+// MAX_DIGEST_BUFFER of 1024. 64 KiB leaves ample room without letting a
+// caller stream megabytes through the TPM.
+const maximumSignedInputOctets = 64 * 1024
+
+// tpm2HashSingleCommandMaximumInputOctets is MAX_DIGEST_BUFFER on every
+// TPM 2.0 we support; longer input uses a hash sequence.
+const tpm2HashSingleCommandMaximumInputOctets = 1024
+
+// hashOutsideDataWithEndorsementHierarchyTicket has the TPM hash data that
+// came from outside it and returns the SHA-256 digest plus the TPMT_TK_HASHCHECK
+// ticket a RESTRICTED key (our AK, endorsement hierarchy) requires before it
+// signs a digest: the ticket proves the data did not start with
+// TPM_GENERATED_VALUE, so no one can make the AK sign a forged attestation.
+// <= 1024 bytes: one TPM2_Hash. Longer: TPM2_HashSequenceStart +
+// TPM2_SequenceUpdate (1024-byte chunks) + TPM2_SequenceComplete, which yields
+// the same kind of ticket. The sequence object has an empty auth value and
+// is consumed (flushed) by SequenceComplete; on error it is flushed here.
+func hashOutsideDataWithEndorsementHierarchyTicket(
+  tpmTransport transport.TPMCloser,
+  data []byte,
+) (tpm2.TPM2BDigest, tpm2.TPMTTKHashCheck, error) {
+  if len(data) <= tpm2HashSingleCommandMaximumInputOctets {
+    hashResp, err := tpm2.Hash{
+      Data:      tpm2.TPM2BMaxBuffer{Buffer: data},
+      HashAlg:   tpm2.TPMAlgSHA256,
+      Hierarchy: tpm2.TPMRHEndorsement,
+    }.Execute(tpmTransport)
+    if err != nil {
+      return tpm2.TPM2BDigest{}, tpm2.TPMTTKHashCheck{}, fmt.Errorf("TPM2_Hash failed: %w", err)
+    }
+    return hashResp.OutHash, hashResp.Validation, nil
+  }
+
+  startResp, err := tpm2.HashSequenceStart{
+    Auth:    tpm2.TPM2BAuth{Buffer: nil},
+    HashAlg: tpm2.TPMAlgSHA256,
+  }.Execute(tpmTransport)
+  if err != nil {
+    return tpm2.TPM2BDigest{}, tpm2.TPMTTKHashCheck{}, fmt.Errorf("TPM2_HashSequenceStart failed: %w", err)
+  }
+  sequenceHandle := tpm2.AuthHandle{
+    Handle: startResp.SequenceHandle,
+    Auth:   tpm2.PasswordAuth(nil),
+  }
+  sequenceCompleted := false
+  defer func() {
+    if !sequenceCompleted {
+      tpm2.FlushContext{FlushHandle: startResp.SequenceHandle}.Execute(tpmTransport)
+    }
+  }()
+
+  remaining := data
+  // keep the final (<= 1024 byte) chunk for SequenceComplete
+  for len(remaining) > tpm2HashSingleCommandMaximumInputOctets {
+    if _, err := (tpm2.SequenceUpdate{
+      SequenceHandle: sequenceHandle,
+      Buffer:         tpm2.TPM2BMaxBuffer{Buffer: remaining[:tpm2HashSingleCommandMaximumInputOctets]},
+    }).Execute(tpmTransport); err != nil {
+      return tpm2.TPM2BDigest{}, tpm2.TPMTTKHashCheck{}, fmt.Errorf("TPM2_SequenceUpdate failed: %w", err)
+    }
+    remaining = remaining[tpm2HashSingleCommandMaximumInputOctets:]
+  }
+  completeResp, err := tpm2.SequenceComplete{
+    SequenceHandle: sequenceHandle,
+    Buffer:         tpm2.TPM2BMaxBuffer{Buffer: remaining},
+    Hierarchy:      tpm2.TPMRHEndorsement,
+  }.Execute(tpmTransport)
+  if err != nil {
+    return tpm2.TPM2BDigest{}, tpm2.TPMTTKHashCheck{}, fmt.Errorf("TPM2_SequenceComplete failed: %w", err)
+  }
+  sequenceCompleted = true
+  return completeResp.Result, completeResp.Validation, nil
+}
+
 // signWithAKHandle is the shared implementation for signing with any AK handle
 // (transient or persistent).
 func signWithAKHandle(
@@ -89,19 +167,13 @@ func signWithAKHandle(
     return nil, fmt.Errorf("invalid base64 nonce: %w", err)
   }
 
-  if len(nonceBytes) == 0 || len(nonceBytes) > 1024 {
-    return nil, fmt.Errorf("nonce must be 1-1024 bytes, got %d", len(nonceBytes))
+  if len(nonceBytes) == 0 || len(nonceBytes) > maximumSignedInputOctets {
+    return nil, fmt.Errorf("data to sign must be 1-%d bytes, got %d", maximumSignedInputOctets, len(nonceBytes))
   }
 
-  hashCmd := tpm2.Hash{
-    Data:      tpm2.TPM2BMaxBuffer{Buffer: nonceBytes},
-    HashAlg:   tpm2.TPMAlgSHA256,
-    Hierarchy: tpm2.TPMRHEndorsement,
-  }
-
-  hashResp, err := hashCmd.Execute(tpmTransport)
+  digest, validationTicket, err := hashOutsideDataWithEndorsementHierarchyTicket(tpmTransport, nonceBytes)
   if err != nil {
-    return nil, fmt.Errorf("TPM2_Hash failed: %w", err)
+    return nil, err
   }
 
   readPubResp, err := tpm2.ReadPublic{
@@ -116,7 +188,7 @@ func signWithAKHandle(
       Handle: akHandle,
       Name:   readPubResp.Name,
     },
-    Digest: hashResp.OutHash,
+    Digest: digest,
     InScheme: tpm2.TPMTSigScheme{
       Scheme: tpm2.TPMAlgRSASSA,
       Details: tpm2.NewTPMUSigScheme(
@@ -124,7 +196,7 @@ func signWithAKHandle(
         &tpm2.TPMSSchemeHash{HashAlg: tpm2.TPMAlgSHA256},
       ),
     },
-    Validation: hashResp.Validation,
+    Validation: validationTicket,
   }
 
   signResp, err := signCmd.Execute(tpmTransport)
