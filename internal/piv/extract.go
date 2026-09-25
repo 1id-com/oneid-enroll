@@ -17,6 +17,7 @@ import (
   "crypto/elliptic"
   "crypto/x509"
   "encoding/pem"
+  "errors"
   "fmt"
 
   gopiv "github.com/go-piv/piv-go/piv"
@@ -103,7 +104,15 @@ func ExtractPIVAttestationAndEnsureKeyExists(management_key [24]byte) (*PIVExtra
   slot_attestation_cert, attest_err := yubikey_connection.Attest(slot_9a)
 
   if attest_err != nil {
-    // No attestable key in 9a -- generate a new one.
+    // AUD-F31: generate ONLY when slot 9a is really empty. Any other failure
+    // (a key imported for another purpose cannot be attested, or the card could
+    // not be read) must never lead to overwriting the user's key.
+    if !errors.Is(attest_err, gopiv.ErrNotFound) {
+      return nil, fmt.Errorf("slot 9a holds a key that cannot be attested (for example one imported "+
+        "for another purpose) or could not be read (%w); refusing to overwrite it -- use a YubiKey whose "+
+        "slot 9a is empty or holds a key generated on the device", attest_err)
+    }
+    // Slot 9a is empty -- generate a new key.
     // ECCP256 with pin-policy=NEVER, touch-policy=NEVER enables fully
     // autonomous operation (no human interaction for signing).
     _, gen_err := yubikey_connection.GenerateKey(management_key, slot_9a, gopiv.Key{
